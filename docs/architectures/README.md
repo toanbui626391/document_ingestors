@@ -75,10 +75,10 @@ flowchart TD
     Telemetry -.-> Otel
     Telemetry -.-> Logs
 
-    %% Subgraphs Style
+    %% Subgraphs Style (Bigger container has thicker border line)
     style Upstream fill:none,stroke:#475569,stroke-width:2px,stroke-dasharray: 4 4,color:#475569
     style StateTier fill:none,stroke:#475569,stroke-width:2px,stroke-dasharray: 4 4,color:#475569
-    style Ingestor fill:none,stroke:#475569,stroke-width:2px,stroke-dasharray: 4 4,color:#475569
+    style Ingestor fill:none,stroke:#2563eb,stroke-width:3.5px,stroke-dasharray: 6 3,color:#2563eb
     style Sinks fill:none,stroke:#475569,stroke-width:2px,stroke-dasharray: 4 4,color:#475569
     style Observers fill:none,stroke:#475569,stroke-width:2px,stroke-dasharray: 4 4,color:#475569
 

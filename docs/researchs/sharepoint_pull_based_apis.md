@@ -40,7 +40,8 @@ flowchart TD
     IngestWorker -->|6. Stream Blobs & Upsert Metadata| Bronze
     Bronze --> Silver
 
-    style Client fill:none,stroke:#475569,stroke-width:2px,stroke-dasharray: 4 4,color:#475569
+    %% Subgraphs: Transparent with visual hierarchy (Bigger container = thicker border)
+    style Client fill:none,stroke:#2563eb,stroke-width:3.5px,stroke-dasharray: 6 3,color:#2563eb
     style GraphAPI fill:none,stroke:#475569,stroke-width:2px,stroke-dasharray: 4 4,color:#475569
     style Lakehouse fill:none,stroke:#475569,stroke-width:2px,stroke-dasharray: 4 4,color:#475569
 

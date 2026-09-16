@@ -50,10 +50,10 @@ flowchart TD
     Silver --> ChunkWorker
     ChunkWorker --> Gold
 
-    %% Subgraphs: Clean transparent bounding boxes with distinct slate borders
+    %% Subgraphs: Clean transparent bounding boxes with visual hierarchy (Bigger container = thicker border)
     style Sources fill:none,stroke:#475569,stroke-width:2px,stroke-dasharray: 4 4,color:#475569
     style Ingress fill:none,stroke:#475569,stroke-width:2px,stroke-dasharray: 4 4,color:#475569
-    style Workers fill:none,stroke:#475569,stroke-width:2px,stroke-dasharray: 4 4,color:#475569
+    style Workers fill:none,stroke:#2563eb,stroke-width:3.5px,stroke-dasharray: 6 3,color:#2563eb
     style Lakehouse fill:none,stroke:#475569,stroke-width:2px,stroke-dasharray: 4 4,color:#475569
 
     %% High-Visibility Link Arrows (Vivid Cobalt Blue)
