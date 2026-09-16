@@ -1,93 +1,79 @@
 # SharePoint & OneDrive Pull Ingestor Solution Architecture
 
 ## Executive Summary
-This document provides the production-ready solution architecture for the **SharePoint & OneDrive Pull Ingestor**. Operating under a pure pull-based paradigm, this ingestor connects to Microsoft 365 via the **Microsoft Graph Delta Query API**, incrementally synchronizing documents, spreadsheets, presentations, and list items into an Enterprise Data Lakehouse (Delta Lake / Apache Iceberg).
+This document specifies the solution architecture for the **SharePoint & OneDrive Pull Ingestor**. Operating under a pure pull paradigm, this ingestor connects to Microsoft 365 via the **Microsoft Graph Delta Query API** to discover, stream, and catalog documents, spreadsheets, presentations, and list items into Cloud Object Storage and Lakehouse Bronze metadata tables.
 
-The ingestor guarantees **crash-resilient execution** (mid-process restart without rework), **strict Medallion layering**, **zero-trust query-time authorization**, and **enterprise-grade observability**.
+This architecture focuses strictly on the **Ingestor Component**—its internal modular design, incremental state engine, mid-process crash recovery mechanisms, network resilience, raw permission capture, and operational telemetry. Downstream parsing, chunking, and vector indexing are handled by external consumers decoupled from this ingestor.
 
 ---
 
-## 1. End-to-End System Architecture
+## 1. Ingestor Component Architecture & Boundaries
+
+The SharePoint Pull Ingestor runs as a stateless container pod or standalone daemon with well-defined internal modules and boundary interfaces:
 
 ```mermaid
 flowchart TD
-    subgraph Trigger ["1. Trigger & Scheduling Layer"]
-        Scheduler["Orchestrator\n(Kubernetes CronJob / Airflow / Temporal)"]:::blue
-    end
-
-    subgraph StateTier ["2. ACID State & Checkpoint Store"]
-        Checkpoints[("ingestion_state_checkpoints\n(Active Run ID, Page Cursor, Status)")]:::amber
-        Watermarks[("ingestion_watermarks\n(Committed @odata.deltaLink)")]:::amber
-    end
-
-    subgraph SourceSystem ["3. Microsoft 365 Cloud"]
-        GraphDelta["Microsoft Graph Delta API\nGET /drives/{id}/root/delta"]:::purple
-        GraphPerms["Permissions API\nGET /items/{id}/permissions"]:::purple
+    subgraph UpstreamM365 ["1. Microsoft 365 Cloud (Upstream Source)"]
+        GraphDelta["Microsoft Graph Delta Endpoint\nGET /drives/{id}/root/delta"]:::purple
+        GraphPerms["Permissions Endpoint\nGET /items/{id}/permissions"]:::purple
         AzureCDN["Azure Front Door CDN\n(@microsoft.graph.downloadUrl)"]:::purple
     end
 
-    subgraph WorkerPod ["4. SharePoint Ingestion Worker (Container)"]
-        StateEngine["Checkpoint & Recovery Manager\n(State Reconciliation & SIGTERM Handler)"]:::blue
-        DeltaClient["Graph Delta Client\n(Pagination & 429 Backoff)"]:::blue
-        StreamEngine["Streaming Transfer Engine\n(Direct HTTP -> S3/ADLS)"]:::cyan
-        AclEngine["ACL Normalizer\n(Entra ID Security Groups)"]:::red
+    subgraph SharePointIngestor ["2. SharePoint Pull Ingestor Component"]
+        Controller["SharePointIngestController\n(Run Lifecycle & SIGTERM Signal Trapper)"]:::blue
+        DeltaClient["GraphDeltaClient\n(Auth, Paging & 429 Decorrelated Backoff)"]:::blue
+        CheckpointMgr["SharePointCheckpointManager\n(Batch Cursors & Watermark Staging)"]:::amber
+        BlobStreamer["SharePointBlobStreamer\n(Zero-RAM Streaming HTTP -> Cloud Storage)"]:::cyan
+        AclExtractor["SharePointAclExtractor\n(hasUniqueRoleAssignments & Raw ACLs)"]:::red
+        TombstoneHandler["TombstoneDetector\n(@removed Detection & Deletion Auditing)"]:::amber
+        BronzeWriter["BronzeSinkWriter\n(Idempotent Delta Batch Committer)"]:::green
+        Telemetry["IngestorTelemetry\n(Prometheus /metrics & OTel Trace Spans)"]:::cyan
     end
 
-    subgraph StorageTier ["5. Cloud Object Storage"]
-        RawStore[("Raw Object Storage (ADLS Gen2 / S3)\nDeterministic: {tenant}/{drive}/{item_id}/{sha256}.{ext}")]:::green
+    subgraph IngestSinks ["3. External Ingestion Sinks"]
+        StateDB[("ACID State Store\n(ingestion_state_checkpoints)")]:::amber
+        CloudStorage[("Cloud Object Storage (S3 / ADLS Gen2)\nDeterministic: .../{item_id}/{sha256}.{ext}")]:::green
+        BronzeTable[("Bronze Metadata Sink\n(bronze_sharepoint_documents)")]:::green
     end
 
-    subgraph LakehouseTier ["6. Enterprise Medallion Lakehouse"]
-        BronzeTable[("bronze_sharepoint_documents\n(Delta Lake / Iceberg)")]:::green
-        SilverTable[("silver_clean_chunks\n(Normalized ACLs + Semantic Markdown)")]:::green
-        GoldView[("gold_rag_secured_view\n(Late-Binding RLS + Vector Index)")]:::green
+    subgraph Observability ["4. Ingestor Observability Sinks"]
+        Prom["Prometheus Collector\n(Scrapes /metrics on Ingestor)"]:::amber
+        Otel["OpenTelemetry Collector\n(Ingestor Tracing Spans)"]:::cyan
+        Logs["Log Aggregator\n(Structured JSON Logs)"]:::amber
     end
 
-    subgraph TelemetryTier ["7. Monitoring & Telemetry"]
-        OtelExporter["OpenTelemetry Collector\n(Distributed Spans)"]:::cyan
-        PromExporter["Prometheus Scrape Endpoint\n(/metrics)"]:::amber
-    end
+    %% Internal Subsystem Wiring
+    Controller --> DeltaClient
+    Controller --> CheckpointMgr
+    Controller --> BlobStreamer
+    Controller --> AclExtractor
+    Controller --> TombstoneHandler
+    Controller --> BronzeWriter
+    Controller --> Telemetry
 
-    %% Trigger & State
-    Scheduler -->|1. Launch Ingest Job| StateEngine
-    StateEngine <-->|2. Fetch / Update Cursor| Checkpoints
-    StateEngine <-->|3. Read / Promote deltaLink| Watermarks
+    %% Boundary Connections
+    DeltaClient <-->|HTTPS GET /delta| GraphDelta
+    AclExtractor <-->|HTTPS GET /permissions| GraphPerms
+    BlobStreamer <-->|Direct Chunked Stream| AzureCDN
 
-    %% Discovery & Fetch
-    StateEngine -->|4. Execute Delta Call| DeltaClient
-    DeltaClient -->|GET /delta?token=...| GraphDelta
-    GraphDelta -->|Return Items + nextLink| DeltaClient
+    CheckpointMgr <-->|Read / Commit Checkpoints| StateDB
+    BlobStreamer -->|Multipart Upload| CloudStorage
+    BronzeWriter -->|ACID Merge Batch| BronzeTable
 
-    %% Processing
-    DeltaClient -->|Item Unique Perms| GraphPerms
-    GraphPerms -->|Raw Role Assignments| AclEngine
-    DeltaClient -->|Streaming Download URL| StreamEngine
-    StreamEngine -->|Stream Bytes Directly| AzureCDN
-    AzureCDN -->|Stream Raw Bitstream| RawStore
-    StreamEngine -->|Compute SHA-256 & Metadata| BronzeTable
-    AclEngine -->|Append Raw ACLs| BronzeTable
-
-    %% Medallion Promotion
-    BronzeTable --> SilverTable
-    SilverTable --> GoldView
-
-    %% Observability
-    WorkerPod -.-> OtelExporter
-    WorkerPod -.-> PromExporter
+    Telemetry -.-> Prom
+    Telemetry -.-> Otel
+    Telemetry -.-> Logs
 
     %% Subgraphs Style
-    style Trigger fill:none,stroke:#475569,stroke-width:2px,stroke-dasharray: 4 4,color:#475569
-    style StateTier fill:none,stroke:#475569,stroke-width:2px,stroke-dasharray: 4 4,color:#475569
-    style SourceSystem fill:none,stroke:#475569,stroke-width:2px,stroke-dasharray: 4 4,color:#475569
-    style WorkerPod fill:none,stroke:#475569,stroke-width:2px,stroke-dasharray: 4 4,color:#475569
-    style StorageTier fill:none,stroke:#475569,stroke-width:2px,stroke-dasharray: 4 4,color:#475569
-    style LakehouseTier fill:none,stroke:#475569,stroke-width:2px,stroke-dasharray: 4 4,color:#475569
-    style TelemetryTier fill:none,stroke:#475569,stroke-width:2px,stroke-dasharray: 4 4,color:#475569
+    style UpstreamM365 fill:none,stroke:#475569,stroke-width:2px,stroke-dasharray: 4 4,color:#475569
+    style SharePointIngestor fill:none,stroke:#475569,stroke-width:2px,stroke-dasharray: 4 4,color:#475569
+    style IngestSinks fill:none,stroke:#475569,stroke-width:2px,stroke-dasharray: 4 4,color:#475569
+    style Observability fill:none,stroke:#475569,stroke-width:2px,stroke-dasharray: 4 4,color:#475569
 
     %% High-Visibility Link Arrows
     linkStyle default stroke:#0284c7,stroke-width:2px
 
-    %% Reusable High-Luminance Card Classes
+    %% Dual-Mode Card Palette
     classDef default fill:#ffffff,stroke:#475569,stroke-width:2.5px,color:#0f172a;
     classDef blue    fill:#ffffff,stroke:#2563eb,stroke-width:2.5px,color:#0f172a;
     classDef green   fill:#ffffff,stroke:#059669,stroke-width:2.5px,color:#0f172a;
@@ -99,79 +85,66 @@ flowchart TD
 
 ---
 
-## 2. Microsoft Graph Delta Query Engine
+## 2. Ingestor Internal Subsystems
 
-### 2.1 Supported Query Scopes
-The ingestor supports multiple discovery granularities:
-* **Drive Level (Recommended)**: `GET /drives/{drive-id}/root/delta`  
-  Captures all file creations, modifications, moves, renames, and deletions recursively across the entire document library.
-* **Site List Level**: `GET /sites/{site-id}/lists/{list-id}/items/delta`  
-  Synchronizes metadata-heavy lists and non-file document libraries.
-* **User OneDrive Level**: `GET /users/{user-id}/drive/root/delta`  
-  Ingests personal OneDrive document containers.
+### 2.1 `SharePointIngestController` (Lifecycle & Run Orchestration)
+The central driver that coordinates worker startup, recovery, batch processing, and shutdown:
+* **Run Initialization**: Generates a unique `run_id` (UUID), initializes telemetry context, and queries the `SharePointCheckpointManager` for an interrupted checkpoint.
+* **Batch Loop**: Feeds page cursors to the `GraphDeltaClient`, delegates item processing to `BlobStreamer` and `AclExtractor`, and triggers `BronzeSinkWriter`.
+* **Signal Trapping**: Hooks POSIX `SIGTERM` and `SIGINT`. When the container is preempted or evicted, it finishes writing the active item, flushes the batch, commits the checkpoint, and halts gracefully.
 
-### 2.2 Delta Query Protocol & Pagination
-Every synchronization cycle executes the following HTTP request cycle:
-
-```http
-GET https://graph.microsoft.com/v1.0/drives/{drive-id}/root/delta HTTP/1.1
-Host: graph.microsoft.com
-Authorization: Bearer <access_token>
-Prefer: deltashowremoveddatashowalternatechangekey
-Accept: application/json
-```
-
-1. **Intermediate Change Pages**:
-   Responses contain up to `$top=500` items and include an `@odata.nextLink` URL:
-   ```json
-   {
-     "@odata.context": "https://graph.microsoft.com/v1.0/$metadata#Collection(driveItem)",
-     "@odata.nextLink": "https://graph.microsoft.com/v1.0/drives/{id}/root/delta?token=ey...",
-     "value": [ ... ]
-   }
-   ```
-2. **Terminal Completion Page**:
-   When all active changes have been returned, Graph emits an `@odata.deltaLink` instead of `@odata.nextLink`:
-   ```json
-   {
-     "@odata.context": "https://graph.microsoft.com/v1.0/$metadata#Collection(driveItem)",
-     "@odata.deltaLink": "https://graph.microsoft.com/v1.0/drives/{id}/root/delta?token=delta_99z...",
-     "value": []
-   }
-   ```
-   * The opaque `@odata.deltaLink` token encodes the precise transaction log position within SharePoint.
-   * On the subsequent sync run, querying this `@odata.deltaLink` retrieves **only** items modified since that moment.
-
-### 2.3 Token Expiry Protocol (`HTTP 410 Gone`)
-* SharePoint delta tokens expire after **30 days** of inactivity or if internal transaction logs roll over.
-* When this occurs, Microsoft Graph responds with:
+### 2.2 `GraphDeltaClient` (Microsoft Graph Delta Protocol)
+Encapsulates all outbound HTTP communication with Microsoft Graph:
+* **Authentication**: Manages OAuth2 client credentials grant via Microsoft Entra ID (`https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token`) with automated token refresh before expiry.
+* **Delta Endpoints**:
+  - Drive-level (Document Library): `GET /drives/{drive-id}/root/delta`
+  - Site List-level: `GET /sites/{site-id}/lists/{list-id}/items/delta`
+  - User OneDrive-level: `GET /users/{user-id}/drive/root/delta`
+* **Request Configuration**:
   ```http
-  HTTP/1.1 410 Gone
-  Content-Type: application/json
-
-  {
-    "error": {
-      "code": "resyncRequired",
-      "message": "Delta token is expired or invalid. Full synchronization required."
-    }
-  }
+  GET /v1.0/drives/{drive-id}/root/delta?$top=500 HTTP/1.1
+  Host: graph.microsoft.com
+  Authorization: Bearer <access_token>
+  Prefer: deltashowremoveddatashowalternatechangekey
+  Accept: application/json
   ```
-* **Recovery Protocol**:
-  1. The worker intercepts `HTTP 410` with `resyncRequired`.
-  2. The worker marks the checkpoint as `EXPIRED_RESET`.
-  3. The worker clears the saved `deltaLink` from `ingestion_watermarks`.
-  4. The worker restarts synchronization from `/drives/{id}/root/delta` (initial cold-start mode).
-  5. Content hashing (SHA-256) ensures existing files in Cloud Storage and Silver tables are matched without re-downloading or re-embedding.
+* **Pagination Handler**:
+  - Traverses `@odata.nextLink` URLs across intermediate change pages.
+  - Detects the final page by identifying the terminal `@odata.deltaLink`.
+
+### 2.3 `SharePointCheckpointManager` (Mid-Process Restart Engine)
+Ensures zero rework by persisting fine-grained state to the ACID state store:
+* **Active Run Checkpointing**: Tracks `run_id`, `drive_id`, `active_page_cursor` (`@odata.nextLink`), `batch_sequence_number`, and `stage`.
+* **Two-Phase Delta Token Commit**: The terminal `@odata.deltaLink` is held in staging memory until all change pages in the cycle are written to Bronze. It is promoted only upon cycle completion.
+
+### 2.4 `SharePointBlobStreamer` (Direct Zero-Buffer Streaming)
+Streams file binaries without consuming container memory:
+* **CDN Endpoint**: Resolves `@microsoft.graph.downloadUrl`, pointing to Azure Front Door edge nodes.
+* **Piped Transfer**: Reads HTTP chunk streams (e.g. 4MB chunks) directly into the cloud storage multi-part upload client (`boto3` / `azure-storage-blob`).
+* **Streaming Checksum**: Computes `SHA-256` incrementally on the fly as chunks transit through memory.
+* **Deterministic Object URI**:
+  `abfss://lakehouse@{account}.dfs.core.windows.net/raw/sharepoint/{tenant_id}/{drive_id}/{item_id}/{content_sha256}.{ext}`
+
+### 2.5 `SharePointAclExtractor` (Source Permission Ingestion)
+Preserves native Access Control Lists untouched:
+* **Inheritance Inspection**: Inspects `hasUniqueRoleAssignments`. If `false`, the item inherits parent container permissions.
+* **Permission Query**: If `hasUniqueRoleAssignments == true`, calls:
+  `GET /v1.0/drives/{drive-id}/items/{item-id}/permissions`
+* **Raw Preservation**: Normalizes the JSON response into the raw ACL payload written to Bronze without flattening or stripping Entra ID Group IDs.
+
+### 2.6 `TombstoneDetector` (Deletion Detection)
+* Detects the presence of `@removed: {"reason": "deleted"}` in the Graph response.
+* Marks records with `is_deleted = TRUE`, capturing the deletion timestamp and reason for auditability.
+
+### 2.7 `BronzeSinkWriter` (Idempotent Metadata Sinking)
+* Merges metadata batches into the `bronze_sharepoint_documents` Delta table.
+* Uses primary key `(tenant_id, container_id, item_id, version_id)` to ensure repeated execution of an interrupted batch produces zero duplicates.
 
 ---
 
 ## 3. Mid-Process Restart & Reliability Engine (Zero Rework)
 
-Enterprise SharePoint libraries frequently contain millions of documents. If an ingestor pod crashes 80% through a 4-hour synchronization run, re-running from page 1 wastes substantial compute, consumes tenant API quota, and incurs redundant egress costs.
-
-The **Zero-Rework Engine** guarantees that an ingestor resumes from the exact page where it was interrupted.
-
-### 3.1 State Machine & Checkpoint Lifecycle
+Enterprise SharePoint libraries often contain hundreds of thousands of files. When an ingestor container is terminated mid-cycle, the engine guarantees resumption from the exact last uncommitted page.
 
 ```mermaid
 %%{init: {
@@ -203,292 +176,143 @@ The **Zero-Rework Engine** guarantees that an ingestor resumes from the exact pa
 }}%%
 sequenceDiagram
     autonumber
-    participant W as Ingest Worker Pod
-    participant CS as Checkpoint Store (StateDB)
-    participant G as Microsoft Graph API
-    participant OS as Cloud Storage (S3/ADLS)
-    participant B as Bronze Delta Table
-    participant WM as Watermark Store
+    participant Ctrl as SharePointIngestController
+    participant StateDB as State Store (Checkpoints)
+    participant Graph as Microsoft Graph API
+    participant Stream as SharePointBlobStreamer (S3/ADLS)
+    participant Bronze as BronzeSinkWriter (Delta Table)
+    participant Watermark as Watermark Store
 
-    W->>CS: Query Active Checkpoint (drive_id)
-    alt Checkpoint exists with IN_PROGRESS and uncommitted nextLink
-        CS-->>W: Resume from saved page_cursor (nextLink)
-    else No in-progress run
-        W->>WM: Read committed deltaLink
-        WM-->>W: Return deltaLink (or null for full backfill)
+    Ctrl->>StateDB: Query Active Checkpoint (drive_id)
+    alt Unfinished checkpoint exists (status = IN_PROGRESS)
+        StateDB-->>Ctrl: Return active_page_cursor (nextLink)
+    else Clean start
+        Ctrl->>Watermark: Read committed deltaLink
+        Watermark-->>Ctrl: Return deltaLink (or null for cold backfill)
     end
 
     loop For Each Page of Delta Results
-        W->>G: GET current_url (page_cursor or deltaLink)
-        G-->>W: Return 500 DriveItems + nextLink_url
-        W->>CS: Record Stage: BATCH_FETCHED (page_cursor = nextLink_url)
+        Ctrl->>Graph: GET active_page_cursor (or deltaLink)
+        Graph-->>Ctrl: 500 DriveItems + nextLink_url
+        Ctrl->>StateDB: Update Checkpoint (stage=BATCH_FETCHED, cursor=nextLink_url)
 
         loop For Each DriveItem in Page
             alt Item is deleted (@removed)
-                W->>W: Stage Tombstone Record
-            else Content Hash unchanged (cTag == stored_cTag)
-                W->>W: Stage Metadata Update Only (Skip Binary Stream)
-            else Content Hash changed
-                W->>OS: Stream Blob (CDN URL -> S3/ADLS)
-                OS-->>W: Committed Bitstream (Compute SHA-256)
-                W->>W: Stage Insert Record with Blob URI
+                Ctrl->>Ctrl: Stage Tombstone Record
+            else Content unchanged (cTag == stored_cTag)
+                Ctrl->>Ctrl: Stage Metadata update only (Skip binary stream)
+            else Content modified or new
+                Ctrl->>Stream: Stream Blob to Cloud Storage
+                Stream-->>Ctrl: Commit ACK + Computed SHA-256
             end
         end
 
-        W->>B: ACID MERGE INTO bronze_sharepoint_documents (Batch of 500 items)
-        B-->>W: Commit ACK (Delta version N)
-        W->>CS: Update Checkpoint: BATCH_COMMITTED (page_cursor = nextLink_url)
+        Ctrl->>Bronze: ACID MERGE Batch (500 items)
+        Bronze-->>Ctrl: Commit ACK (Delta version N)
+        Ctrl->>StateDB: Update Checkpoint (stage=BATCH_COMMITTED, cursor=nextLink_url)
     end
 
-    note over W,G: Terminal Page Reached: @odata.deltaLink returned
-    W->>WM: Promote & Persist new deltaLink
-    W->>CS: Mark Checkpoint: COMPLETED
+    note over Ctrl,Graph: Terminal Page Reached: @odata.deltaLink returned
+    Ctrl->>Watermark: Promote Staged deltaLink to Committed Watermark
+    Ctrl->>StateDB: Mark Checkpoint (status=COMPLETED)
 ```
 
-### 3.2 Checkpoint State Store Schema
-The checkpoint store is maintained in an ACID-compliant table (`ingestion_state_checkpoints`):
+### 3.1 Crash Recovery Matrix
 
-```sql
-CREATE TABLE IF NOT EXISTS ingestion_state_checkpoints (
-    tenant_id               STRING NOT NULL,
-    container_id            STRING NOT NULL,     -- drive_id
-    run_id                  STRING NOT NULL,     -- UUID per invocation
-    stage                   STRING NOT NULL,     -- 'INITIALIZED', 'IN_PROGRESS', 'BATCH_COMMITTED', 'COMPLETED', 'FAILED'
-    active_page_cursor      STRING,              -- @odata.nextLink URL
-    pending_delta_link      STRING,              -- Terminal @odata.deltaLink
-    items_processed_in_run  BIGINT NOT NULL DEFAULT 0,
-    bytes_streamed_in_run   BIGINT NOT NULL DEFAULT 0,
-    last_error_message      STRING,
-    created_at              TIMESTAMP NOT NULL,
-    updated_at              TIMESTAMP NOT NULL
-) USING DELTA
-PARTITIONED BY (tenant_id);
-```
-
-### 3.3 Crash Recovery Matrix
-
-| Crash Point | System State | Resume Action on Container Restart | Rework Incurred |
+| Crash Scenario | System State at Crash | Ingestor Action on Restart | Rework Incurred |
 | :--- | :--- | :--- | :--- |
-| **During Blob Streaming** | Some blobs written to object storage; batch not merged into Bronze. | Worker re-queries the stored `active_page_cursor`. Before streaming each item, worker checks if target key exists in Object Storage with matching SHA-256. If exists, streaming is skipped. | **Zero**. Storage key idempotency prevents redundant network transfers. |
-| **During Bronze Delta Table Merge** | Merge transaction aborts due to Delta ACID rollback. | Delta transaction guarantees atomicity. On restart, worker re-reads the same page and re-applies the merge cleanly. | **Zero**. No duplicate records created. |
-| **After Bronze Merge, Before Checkpoint Update** | Bronze has records, but checkpoint still points to prior cursor. | Worker fetches page again; `MERGE INTO` detects matching `(item_id, version_id)` and performs an idempotent no-op update. | **Minimal** (1 Graph GET call; zero blob downloads). |
-| **Between Batches (Graceful Shutdown / Preemption)** | Checkpoint has committed `active_page_cursor`. | Worker initializes with `active_page_cursor` and immediately fetches next page. | **Zero rework**. |
+| **Crash during Blob Streaming** | Partial blobs written to Object Storage; batch not committed to Bronze. | Ingestor re-queries the saved `active_page_cursor`. For each item, it checks if the deterministic key (`.../{sha256}.{ext}`) already exists in Cloud Storage via `HEAD`. If present, streaming is bypassed. | **Zero duplicate bytes transferred.** |
+| **Crash during Bronze Merge** | Bronze transaction rolled back automatically by Delta Lake ACID engine. | Ingestor re-fetches the same cursor; batch is re-merged cleanly. | **Zero duplicate records created.** |
+| **Crash after Bronze Commit, before Checkpoint Commit** | Bronze table has records; checkpoint still points to previous cursor. | Ingestor re-reads the page; `MERGE INTO` detects existing `(item_id, version_id)` keys and performs an idempotent no-op. | Minimal (1 Graph GET call; zero re-downloads). |
+| **Graceful Preemption (SIGTERM)** | Kubernetes sends termination signal to worker pod. | `SharePointIngestController` traps signal, completes current batch, writes checkpoint, and halts. | **Zero rework.** |
 
-### 3.4 Graceful Shutdown Signal Handler (POSIX SIGTERM / SIGINT)
-Ingestors deployed on Kubernetes or spot VMs must handle preemption signals cleanly:
-
-```python
-import signal
-import sys
-import logging
-
-class GracefulKiller:
-    kill_now = False
-    def __init__(self):
-        signal.signal(signal.SIGINT, self.exit_gracefully)
-        signal.signal(signal.SIGTERM, self.exit_gracefully)
-
-    def exit_gracefully(self, signum, frame):
-        logging.warning(f"Received termination signal {signum}. Completing current item and halting pagination.")
-        self.kill_now = True
-
-# Ingest Loop Hook
-killer = GracefulKiller()
-while current_url and not killer.kill_now:
-    # Process current page batch...
-    commit_batch_and_checkpoint(next_cursor)
-    if killer.kill_now:
-        logging.info("Clean shutdown achieved. Cursor bookmarked. Exiting.")
-        sys.exit(0)
-```
+### 3.2 Token Expiry Recovery Protocol (`HTTP 410 Gone`)
+Delta tokens expire after 30 days of inactivity or if SharePoint transaction logs roll over.
+1. When Graph returns `HTTP 410 Gone` with code `resyncRequired`:
+2. `GraphDeltaClient` catches the error.
+3. `SharePointCheckpointManager` invalidates the stale `deltaLink` and marks the checkpoint as `RESET_REQUIRED`.
+4. The ingestor initiates a fresh crawl from `/drives/{drive-id}/root/delta`.
+5. Pre-flight checksum matching (`content_sha256`) against the Lakehouse Bronze catalog ensures existing files are matched without re-downloading binaries.
 
 ---
 
-## 4. Binary Downloads & Content-Addressable Storage
+## 4. Network Resilience & Rate-Limiting Engine
 
-### 4.1 Direct Pre-Authenticated CDN Streaming
-* DriveItems in Graph Delta responses provide an `@microsoft.graph.downloadUrl` attribute.
-* This URL points to **Azure Front Door / Microsoft Edge CDN nodes**.
-* **Zero Buffer Rule**: Workers never read entire files into RAM (`bytearray` or `BytesIO`). Streams are piped directly via chunked transfer (`requests.get(stream=True)`) into the cloud object store multi-part upload client (`boto3`, `azure-storage-blob`, or `google-cloud-storage`).
+Microsoft Graph applies dynamic tenant-level throttling under burst operations.
 
-```mermaid
-flowchart LR
-    subgraph Graph ["Microsoft Cloud"]
-        CDN["Azure Front Door CDN\n(@microsoft.graph.downloadUrl)"]:::purple
-    end
-
-    subgraph Memory ["Ingest Worker RAM"]
-        Buffer["Small 4MB Stream Buffer\n(Computes SHA-256 on the fly)"]:::blue
-    end
-
-    subgraph Bucket ["Cloud Object Storage"]
-        TargetBlob["ADLS Gen2 / AWS S3\ns3://bucket/sharepoint/..."]:::green
-    end
-
-    CDN -->|1. Chunked HTTP Stream| Buffer
-    Buffer -->|2. Multipart PutBlock Stream| TargetBlob
-
-    classDef default fill:#ffffff,stroke:#475569,stroke-width:2.5px,color:#0f172a;
-    classDef blue    fill:#ffffff,stroke:#2563eb,stroke-width:2.5px,color:#0f172a;
-    classDef green   fill:#ffffff,stroke:#059669,stroke-width:2.5px,color:#0f172a;
-    classDef purple  fill:#ffffff,stroke:#7c3aed,stroke-width:2.5px,color:#0f172a;
-    linkStyle default stroke:#0284c7,stroke-width:2px;
-```
-
-### 4.2 Deterministic Path Specification
-Blob storage URIs follow a deterministic, content-addressed path:
-
-```
-abfss://lakehouse@{account}.dfs.core.windows.net/raw/sharepoint/{tenant_id}/{drive_id}/{item_id}/{content_sha256}.{extension}
-```
-
-* **Content-Addressable**: If an item is renamed, its storage path remains unchanged unless its contents change.
-* **FinOps Optimization**: If an administrator modifies file metadata, tags, or permissions without changing file content, the worker verifies `cTag` or `content_sha256`, skips the download, and updates only the Lakehouse metadata row.
-
----
-
-## 5. Security, Identity & Late-Binding Access Control (ACLs)
-
-### 5.1 Permission Inheritance & Extraction
-SharePoint permissions operate on an inheritance hierarchy (Site -> Library -> Folder -> Item).
-
-```mermaid
-flowchart TD
-    Item["DriveItem Received from Delta Query"]:::blue
-    Check{"hasUniqueRoleAssignments == true?"}:::amber
-    Inherit["Bind Parent Folder ACLs\n(Inherited Permissions)"]:::green
-    Fetch["Call Graph Permissions API\nGET /drives/{id}/items/{id}/permissions"]:::purple
-    Normalize["Extract Principals:\n- Entra ID Security Group Object IDs\n- User Principal Names (UPN)\n- Sharing Link Tokens"]:::red
-    BronzeRecord["Persist raw_acls JSON in Bronze\nTag normalized allowed_principals in Silver"]:::green
-
-    Item --> Check
-    Check -- "No" --> Inherit
-    Check -- "Yes" --> Fetch
-    Fetch --> Normalize
-    Inherit --> BronzeRecord
-    Normalize --> BronzeRecord
-
-    classDef default fill:#ffffff,stroke:#475569,stroke-width:2.5px,color:#0f172a;
-    classDef blue    fill:#ffffff,stroke:#2563eb,stroke-width:2.5px,color:#0f172a;
-    classDef green   fill:#ffffff,stroke:#059669,stroke-width:2.5px,color:#0f172a;
-    classDef amber   fill:#ffffff,stroke:#d97706,stroke-width:2.5px,color:#0f172a;
-    classDef purple  fill:#ffffff,stroke:#7c3aed,stroke-width:2.5px,color:#0f172a;
-    classDef red     fill:#ffffff,stroke:#dc2626,stroke-width:2.5px,color:#0f172a;
-    linkStyle default stroke:#0284c7,stroke-width:2px;
-```
-
-### 5.2 Late-Binding Query Enforcement (Fail-Closed)
-1. **No Static User Bakes**: Permissions are never statically attached to text chunks based on individual user IDs.
-2. **Group Object IDs**: Silver chunks store arrays of authorized Entra ID Group IDs (`authorized_group_ids: ["9b1deb4d-3b7d-4b69-9d54-8e3d4615dd10", ...]`).
-3. **Query-Time Filter**: When an enterprise user executes a RAG vector search, the query service retrieves their evaluated active Entra ID group memberships and injects a row-level filter:
-   $$\text{Filter: } \text{user\_active\_groups} \cap \text{chunk\_authorized\_groups} \neq \emptyset$$
-4. **Fail-Closed Rule**: If the permission endpoint fails with `HTTP 403` or timeout, the record is flagged with `is_restricted = TRUE` and omitted from the Gold consumption view.
-
----
-
-## 6. Tombstone & Lifecycle Propagation
-
-### 6.1 Delta Deletion Detection (`@removed`)
-When a file or folder is deleted in SharePoint, the Delta response emits a tombstone facet:
-
-```json
-{
-  "@odata.type": "#microsoft.graph.driveItem",
-  "id": "01ABCD5678EFGH",
-  "name": "Q3_Report.docx",
-  "@removed": {
-    "reason": "deleted"
-  }
-}
-```
-
-### 6.2 Cascade Purge Lifecycle
-1. **Bronze Lakehouse**: The ingestor appends a tombstone audit record:
-   ```sql
-   INSERT INTO bronze_sharepoint_documents (
-       tenant_id, container_id, item_id, is_deleted, deleted_at, ingestion_timestamp
-   ) VALUES (
-       'contoso_tenant', 'drive_123', '01ABCD5678EFGH', TRUE, CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP()
-   );
-   ```
-2. **Silver Table**: The silver transformation pipeline sets `is_active = FALSE` for all chunks associated with `01ABCD5678EFGH`.
-3. **Vector Database**: Downstream vector synchronizer issues an immediate filter deletion to eliminate zombie citations:
-   ```python
-   vector_store.delete(filter={"item_id": "01ABCD5678EFGH"})
-   ```
-
----
-
-## 7. Network Resilience & Rate Limiting
-
-### 7.1 Throttling Protection (HTTP 429 & Decorrelated Jitter)
-Microsoft Graph enforces tenant-level request thresholds. The ingestor implements a strict backoff algorithm:
+### 4.1 Throttling Protection (HTTP 429 & Decorrelated Jitter)
+The ingestor implements the full jitter exponential backoff protocol:
 
 ```python
 import time
 import random
 import requests
+import logging
 
-def graph_request_with_backoff(url: str, headers: dict, max_retries: int = 5):
-    attempt = 0
-    sleep_time = 1.0
-    
-    while attempt < max_retries:
-        response = requests.get(url, headers=headers)
-        
-        if response.status_code == 429:
-            attempt += 1
-            retry_after = response.headers.get("Retry-After")
-            if retry_after:
-                backoff = float(retry_after)
-            else:
-                # Full jitter exponential backoff
-                backoff = min(60.0, sleep_time * (2 ** attempt)) + random.uniform(0.5, 1.5)
-            
-            logging.warning(f"Graph HTTP 429 Throttled. Backing off for {backoff:.2f}s (Attempt {attempt}/{max_retries})")
-            time.sleep(backoff)
-            continue
-            
-        return response
-        
-    response.raise_for_status()
+class ResilientGraphClient:
+    def execute_request(self, url: str, headers: dict, max_retries: int = 5) -> requests.Response:
+        attempt = 0
+        base_sleep = 1.0
+
+        while attempt < max_retries:
+            resp = requests.get(url, headers=headers, timeout=30)
+
+            if resp.status_code == 429:
+                attempt += 1
+                retry_after = resp.headers.get("Retry-After")
+                if retry_after:
+                    backoff = float(retry_after)
+                else:
+                    backoff = min(60.0, base_sleep * (2 ** attempt)) + random.uniform(0.5, 1.5)
+
+                logging.warning(
+                    f"Graph throttled (HTTP 429). Backing off {backoff:.2f}s "
+                    f"(Attempt {attempt}/{max_retries})"
+                )
+                time.sleep(backoff)
+                continue
+
+            resp.raise_for_status()
+            return resp
+
+        raise RuntimeError(f"Exceeded max retries ({max_retries}) for URL: {url}")
 ```
 
 ---
 
-## 8. Observability, Logging & Monitoring
+## 5. Ingestor Observability & Telemetry
 
-### 8.1 Prometheus Metrics Catalog
+### 5.1 Prometheus Metrics Catalog
 
 | Metric Name | Type | Labels | Description |
 | :--- | :--- | :--- | :--- |
-| `sharepoint_sync_duration_seconds` | Histogram | `tenant_id`, `drive_id`, `status` | Total duration of a drive synchronization run. |
-| `sharepoint_items_discovered_total` | Counter | `tenant_id`, `drive_id` | Count of DriveItems identified in delta responses. |
+| `sharepoint_sync_duration_seconds` | Histogram | `tenant_id`, `drive_id`, `status` | Execution duration of a drive synchronization run. |
+| `sharepoint_items_discovered_total` | Counter | `tenant_id`, `drive_id` | Count of DriveItems returned in delta responses. |
 | `sharepoint_items_downloaded_total` | Counter | `tenant_id`, `drive_id`, `mime_type` | Count of raw file binaries successfully streamed. |
 | `sharepoint_items_skipped_cache_total` | Counter | `tenant_id`, `drive_id` | Count of files skipped due to identical content SHA-256. |
 | `sharepoint_items_tombstoned_total` | Counter | `tenant_id`, `drive_id` | Count of deleted items (@removed) processed. |
-| `sharepoint_bytes_streamed_total` | Counter | `tenant_id`, `drive_id` | Total raw payload bytes transferred to object storage. |
-| `sharepoint_api_requests_total` | Counter | `endpoint`, `status_code` | HTTP requests to Microsoft Graph API. |
-| `sharepoint_api_throttles_429_total` | Counter | `endpoint`, `drive_id` | Total HTTP 429 throttle responses encountered. |
-| `sharepoint_watermark_lag_seconds` | Gauge | `tenant_id`, `drive_id` | Difference between `now()` and timestamp of last successful sync. |
-| `sharepoint_checkpoint_commits_total` | Counter | `tenant_id`, `drive_id`, `stage` | Count of successful checkpoint transitions committed. |
+| `sharepoint_bytes_streamed_total` | Counter | `tenant_id`, `drive_id` | Total raw payload bytes transferred to cloud storage. |
+| `sharepoint_api_requests_total` | Counter | `endpoint`, `status_code` | Total HTTP requests made to Microsoft Graph API. |
+| `sharepoint_api_throttles_429_total` | Counter | `endpoint`, `drive_id` | Count of HTTP 429 throttle responses encountered. |
+| `sharepoint_watermark_lag_seconds` | Gauge | `tenant_id`, `drive_id` | Time delta between `now()` and timestamp of last successful sync. |
+| `sharepoint_checkpoint_commits_total` | Counter | `tenant_id`, `drive_id`, `stage` | Count of checkpoint state transitions committed. |
 
-### 8.2 OpenTelemetry Distributed Tracing
-Every synchronization run initializes an OpenTelemetry root trace:
+### 5.2 OpenTelemetry Distributed Tracing
+Each ingest cycle generates a root trace capturing end-to-end timing:
 
 ```
 [Trace: sharepoint_sync_drive]
-  ├── [Span: state.get_checkpoint]
-  ├── [Span: graph.fetch_delta_page] (attributes: page_index=1, items_returned=500)
-  │     ├── [Span: blob.stream_to_s3] (attributes: item_id, bytes=1542010, sha256)
-  │     ├── [Span: graph.fetch_permissions] (attributes: item_id)
-  │     └── [Span: delta.merge_bronze] (attributes: records=500)
-  ├── [Span: state.commit_checkpoint] (attributes: cursor_url)
-  └── [Span: watermark.commit_delta_link] (attributes: final_delta_token)
+  ├── [Span: checkpoint.get_active_cursor]
+  ├── [Span: graph.fetch_delta_page] (attributes: page_size=500, has_next=true)
+  │     ├── [Span: blob.stream_to_storage] (attributes: item_id, bytes=1542010, sha256)
+  │     ├── [Span: graph.fetch_permissions] (attributes: item_id, has_unique=true)
+  │     └── [Span: bronze.acid_merge_batch] (attributes: batch_size=500)
+  ├── [Span: checkpoint.commit_batch] (attributes: committed_cursor)
+  └── [Span: watermark.commit_delta_link] (attributes: delta_token)
 ```
 
-### 8.3 Structured JSON Audit Logging
-Every log entry adheres to a structured schema compatible with Grafana Loki, Datadog, and AWS CloudWatch:
+### 5.3 Structured JSON Audit Logging
+Every log entry emitted by the ingestor contains complete execution context:
 
 ```json
 {
@@ -510,42 +334,11 @@ Every log entry adheres to a structured schema compatible with Grafana Loki, Dat
 }
 ```
 
-### 8.4 Prometheus Operational Alerts (PromQL)
-
-```yaml
-groups:
-  - name: sharepoint_ingestion_alerts
-    rules:
-      - alert: SharePointWatermarkLagHigh
-        expr: sharepoint_watermark_lag_seconds > 86400
-        for: 1h
-        labels:
-          severity: critical
-        annotations:
-          summary: "SharePoint Drive {{ $labels.drive_id }} synchronization lag exceeds 24 hours."
-
-      - alert: SharePointThrottlingSpike
-        expr: rate(sharepoint_api_throttles_429_total[15m]) > 0.1
-        for: 5m
-        labels:
-          severity: warning
-        annotations:
-          summary: "High HTTP 429 throttling rate on SharePoint tenant {{ $labels.tenant_id }}."
-
-      - alert: SharePointCheckpointStalled
-        expr: increase(sharepoint_checkpoint_commits_total[1h]) == 0 and sharepoint_watermark_lag_seconds > 7200
-        for: 30m
-        labels:
-          severity: critical
-        annotations:
-          summary: "SharePoint ingestor run stalled for drive {{ $labels.drive_id }}. No checkpoints committed in 1 hour."
-```
-
 ---
 
-## 9. Lakehouse Table Contracts & DDL
+## 6. External Data Contracts & Table DDL
 
-### 9.1 Bronze Delta Table DDL
+### 6.1 Bronze Delta Table DDL (`bronze_sharepoint_documents`)
 ```sql
 CREATE TABLE IF NOT EXISTS bronze_sharepoint_documents (
     tenant_id               STRING NOT NULL,
@@ -570,16 +363,20 @@ CREATE TABLE IF NOT EXISTS bronze_sharepoint_documents (
 PARTITIONED BY (tenant_id, container_id);
 ```
 
-### 9.2 Watermark State Table DDL
+### 6.2 Checkpoint State Store DDL (`ingestion_state_checkpoints`)
 ```sql
-CREATE TABLE IF NOT EXISTS ingestion_watermarks (
-    source_system           STRING NOT NULL,       -- 'sharepoint'
+CREATE TABLE IF NOT EXISTS ingestion_state_checkpoints (
     tenant_id               STRING NOT NULL,
     container_id            STRING NOT NULL,       -- drive_id
-    delta_link              STRING NOT NULL,       -- @odata.deltaLink
-    last_successful_sync_at TIMESTAMP NOT NULL,
-    items_synced_total      BIGINT NOT NULL,
+    run_id                  STRING NOT NULL,       -- UUID per run
+    stage                   STRING NOT NULL,       -- 'IN_PROGRESS', 'BATCH_COMMITTED', 'COMPLETED', 'FAILED'
+    active_page_cursor      STRING,                -- @odata.nextLink URL
+    pending_delta_link      STRING,                -- Terminal @odata.deltaLink
+    items_processed_in_run  BIGINT NOT NULL DEFAULT 0,
+    bytes_streamed_in_run   BIGINT NOT NULL DEFAULT 0,
+    last_error_message      STRING,
+    created_at              TIMESTAMP NOT NULL,
     updated_at              TIMESTAMP NOT NULL
 ) USING DELTA
-PARTITIONED BY (source_system, tenant_id);
+PARTITIONED BY (tenant_id);
 ```

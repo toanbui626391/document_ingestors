@@ -1,96 +1,81 @@
 # Confluence Pull Ingestor Solution Architecture
 
 ## Executive Summary
-This document defines the production solution architecture for the **Atlassian Confluence Pull Ingestor**. Designed for secure enterprise environments without public webhooks, this ingestor synchronizes Confluence Cloud and Data Center workspaces (Spaces, Pages, Blogposts, and Attachments) into an Enterprise Data Lakehouse (Delta Lake / Apache Iceberg).
+This document specifies the solution architecture for the **Confluence Pull Ingestor**. Operating under a pure pull paradigm, this ingestor connects to Atlassian Confluence Cloud and Data Center workspaces to discover, stream, and catalog Spaces, Pages, Blogposts, and Attachments into Cloud Object Storage and Lakehouse Bronze metadata tables.
 
-The ingestor features an optimized **Descending Sort + Early-Exit** incremental pull engine, **mid-process crash recovery with zero rework**, **decoupled attachment blob streaming**, and **late-binding permission enforcement**.
+This architecture focuses strictly on the **Ingestor Component**—its internal modular subsystems, the descending sort early-exit incremental engine, candidate high-watermark staging for mid-process crash recovery, decoupled attachment streaming, raw permission capture, and operational telemetry. Downstream Markdown extraction, semantic chunking, and vector indexing are decoupled and managed by downstream consumer pipelines.
 
 ---
 
-## 1. End-to-End System Architecture
+## 1. Ingestor Component Architecture & Boundaries
+
+The Confluence Pull Ingestor runs as a stateless container pod or standalone daemon with well-defined internal modules and boundary interfaces:
 
 ```mermaid
 flowchart TD
-    subgraph Trigger ["1. Trigger & Scheduling Layer"]
-        Scheduler["Orchestrator\n(Kubernetes CronJob / Airflow / Temporal)"]:::blue
-    end
-
-    subgraph StateTier ["2. ACID State & Checkpoint Store"]
-        Checkpoints[("confluence_state_checkpoints\n(Active Cursor, Candidate High Watermark)")]:::amber
-        Watermarks[("confluence_watermarks\n(Committed last_sync_watermark)")]:::amber
-    end
-
-    subgraph ConfluenceCloud ["3. Atlassian Confluence Cloud"]
-        V2Pages["REST API v2 Pages\nGET /wiki/api/v2/pages?sort=-modified-date"]:::purple
+    subgraph UpstreamAtlassian ["1. Atlassian Confluence (Upstream Source)"]
+        V2Pages["REST API v2 Pages & Blogs\nGET /wiki/api/v2/pages?sort=-modified-date"]:::purple
         V2Attach["REST API v2 Attachments\nGET /wiki/api/v2/attachments"]:::purple
-        V2Perms["Content Restrictions API\nGET /wiki/api/v2/pages/{id}/restrictions"]:::purple
-        DownloadCDN["Atlassian Media CDN\n(/wiki/download/attachments/...)"]:::purple
+        V2Perms["Restrictions Endpoint\nGET /wiki/api/v2/pages/{id}/restrictions"]:::purple
+        MediaCDN["Atlassian Media CDN\n(/wiki/download/attachments/...)"]:::purple
     end
 
-    subgraph WorkerPod ["4. Confluence Ingestion Worker (Container)"]
-        RecoveryEngine["Checkpoint & Recovery Manager\n(Candidate Watermark Staging)"]:::blue
-        PullClient["Confluence Cursor Client\n(Early-Exit Logic & 429 Backoff)"]:::blue
-        AttachmentStreamer["Attachment Streaming Engine\n(Direct HTTP -> S3/ADLS)"]:::cyan
-        AclEngine["Restriction Parser\n(Atlassian Group ID Mapping)"]:::red
+    subgraph ConfluenceIngestor ["2. Confluence Pull Ingestor Component"]
+        Controller["ConfluenceIngestController\n(Run Lifecycle & SIGTERM Signal Trapper)"]:::blue
+        CursorClient["ConfluenceCursorClient\n(Early-Exit Engine & 429 Token Bucket Backoff)"]:::blue
+        CandidateWmMgr["CandidateWatermarkManager\n(Descending Cursor & Watermark Staging)"]:::amber
+        AttachmentStreamer["ConfluenceAttachmentStreamer\n(Zero-RAM Streaming HTTP -> Cloud Storage)"]:::cyan
+        RestrictionParser["ConfluenceRestrictionExtractor\n(Page Restrictions & Space Permissions)"]:::red
+        TombstoneDetector["TombstoneDetector\n(Trashed Status & Deletion Auditing)"]:::amber
+        BronzeWriter["BronzeSinkWriter\n(Idempotent Delta Batch Committer)"]:::green
+        Telemetry["IngestorTelemetry\n(Prometheus /metrics & OTel Trace Spans)"]:::cyan
     end
 
-    subgraph StorageTier ["5. Cloud Object Storage"]
-        AttachmentStore[("Raw Object Storage (S3 / ADLS Gen2)\nDeterministic: {space}/{page_id}/{sha256}.{ext}")]:::green
+    subgraph IngestSinks ["3. External Ingestion Sinks"]
+        StateDB[("ACID State Store\n(confluence_state_checkpoints)")]:::amber
+        AttachmentStore[("Cloud Object Storage (S3 / ADLS Gen2)\nDeterministic: .../{item_id}/{sha256}.{ext}")]:::green
+        BronzeTable[("Bronze Metadata Sink\n(bronze_confluence_documents)")]:::green
     end
 
-    subgraph LakehouseTier ["6. Enterprise Medallion Lakehouse"]
-        BronzeTable[("bronze_confluence_documents\n(Raw Storage XHTML + Metadata + ACLs)")]:::green
-        SilverTable[("silver_clean_chunks\n(Clean Markdown + Section Breadcrumbs)")]:::green
-        GoldIndex[("gold_rag_vector_index\n(Late-Binding RLS + Dense Embeddings)")]:::green
+    subgraph Observability ["4. Ingestor Observability Sinks"]
+        Prom["Prometheus Collector\n(Scrapes /metrics on Ingestor)"]:::amber
+        Otel["OpenTelemetry Collector\n(Ingestor Tracing Spans)"]:::cyan
+        Logs["Log Aggregator\n(Structured JSON Logs)"]:::amber
     end
 
-    subgraph TelemetryTier ["7. Monitoring & Telemetry"]
-        OtelExporter["OpenTelemetry Collector\n(Distributed Traces)"]:::cyan
-        PromExporter["Prometheus Scrape Endpoint\n(/metrics)"]:::amber
-    end
+    %% Internal Subsystem Wiring
+    Controller --> CursorClient
+    Controller --> CandidateWmMgr
+    Controller --> AttachmentStreamer
+    Controller --> RestrictionParser
+    Controller --> TombstoneDetector
+    Controller --> BronzeWriter
+    Controller --> Telemetry
 
-    %% Workflow Connections
-    Scheduler -->|1. Trigger Space Ingest| RecoveryEngine
-    RecoveryEngine <-->|2. Fetch Active Checkpoint| Checkpoints
-    RecoveryEngine <-->|3. Read Committed Watermark| Watermarks
+    %% Boundary Connections
+    CursorClient <-->|HTTPS GET v2/pages| V2Pages
+    RestrictionParser <-->|HTTPS GET restrictions| V2Perms
+    AttachmentStreamer <-->|HTTPS GET v2/attachments| V2Attach
+    AttachmentStreamer <-->|Direct Chunked Stream| MediaCDN
 
-    RecoveryEngine -->|4. Start Traversal| PullClient
-    PullClient -->|GET Pages with sort=-modified-date| V2Pages
-    V2Pages -->|Return Batch + next cursor| PullClient
+    CandidateWmMgr <-->|Read / Commit Checkpoints| StateDB
+    AttachmentStreamer -->|Multipart Upload| AttachmentStore
+    BronzeWriter -->|ACID Merge Batch| BronzeTable
 
-    PullClient -->|Fetch Page Restrictions| V2Perms
-    V2Perms -->|User & Group Restrictions| AclEngine
-
-    PullClient -->|Query Child Attachments| V2Attach
-    V2Attach -->|Attachment Download Links| AttachmentStreamer
-    AttachmentStreamer -->|Stream Binary Directly| DownloadCDN
-    DownloadCDN -->|Stream Raw Bitstream| AttachmentStore
-
-    PullClient -->|Stage XHTML + Metadata| BronzeTable
-    AttachmentStreamer -->|Stage Blob URIs| BronzeTable
-    AclEngine -->|Append Raw ACLs| BronzeTable
-
-    %% Medallion Progression
-    BronzeTable --> SilverTable
-    SilverTable --> GoldIndex
-
-    %% Observability
-    WorkerPod -.-> OtelExporter
-    WorkerPod -.-> PromExporter
+    Telemetry -.-> Prom
+    Telemetry -.-> Otel
+    Telemetry -.-> Logs
 
     %% Subgraphs Style
-    style Trigger fill:none,stroke:#475569,stroke-width:2px,stroke-dasharray: 4 4,color:#475569
-    style StateTier fill:none,stroke:#475569,stroke-width:2px,stroke-dasharray: 4 4,color:#475569
-    style ConfluenceCloud fill:none,stroke:#475569,stroke-width:2px,stroke-dasharray: 4 4,color:#475569
-    style WorkerPod fill:none,stroke:#475569,stroke-width:2px,stroke-dasharray: 4 4,color:#475569
-    style StorageTier fill:none,stroke:#475569,stroke-width:2px,stroke-dasharray: 4 4,color:#475569
-    style LakehouseTier fill:none,stroke:#475569,stroke-width:2px,stroke-dasharray: 4 4,color:#475569
-    style TelemetryTier fill:none,stroke:#475569,stroke-width:2px,stroke-dasharray: 4 4,color:#475569
+    style UpstreamAtlassian fill:none,stroke:#475569,stroke-width:2px,stroke-dasharray: 4 4,color:#475569
+    style ConfluenceIngestor fill:none,stroke:#475569,stroke-width:2px,stroke-dasharray: 4 4,color:#475569
+    style IngestSinks fill:none,stroke:#475569,stroke-width:2px,stroke-dasharray: 4 4,color:#475569
+    style Observability fill:none,stroke:#475569,stroke-width:2px,stroke-dasharray: 4 4,color:#475569
 
     %% High-Visibility Link Arrows
     linkStyle default stroke:#0284c7,stroke-width:2px
 
-    %% Reusable High-Luminance Card Classes
+    %% Dual-Mode Card Palette
     classDef default fill:#ffffff,stroke:#475569,stroke-width:2.5px,color:#0f172a;
     classDef blue    fill:#ffffff,stroke:#2563eb,stroke-width:2.5px,color:#0f172a;
     classDef green   fill:#ffffff,stroke:#059669,stroke-width:2.5px,color:#0f172a;
@@ -102,91 +87,65 @@ flowchart TD
 
 ---
 
-## 2. Confluence Incremental Pull Mechanics
+## 2. Ingestor Internal Subsystems
 
-Unlike Microsoft Graph (which yields a single forward delta token), Confluence incremental synchronization relies on **cursor traversal over time-ordered resources** or **CQL date queries**.
+### 2.1 `ConfluenceIngestController` (Lifecycle & Run Orchestration)
+The central orchestrator driving space synchronization:
+* **Run Initialization**: Generates a unique `run_id` (UUID), initializes telemetry context, and queries the `CandidateWatermarkManager` for existing checkpoints.
+* **Batch Loop**: Iterates through change pages from `ConfluenceCursorClient`, invokes `AttachmentStreamer` for attached files, gathers permissions via `ConfluenceRestrictionExtractor`, and commits batches via `BronzeSinkWriter`.
+* **Signal Trapping**: Intercepts POSIX `SIGTERM` and `SIGINT` (e.g. during Kubernetes pod eviction), halts subsequent page polling, flushes pending in-flight attachment streams, commits the current cursor, and exits cleanly with code 0.
 
-### 2.1 Primary Engine: REST API v2 Cursor Traversal
-Confluence REST API v2 provides cursor-based pagination that eliminates legacy offset degradation (`start=10000`).
+### 2.2 `ConfluenceCursorClient` (Early-Exit Incremental Engine)
+Manages outbound REST requests and pagination across Confluence Cloud:
+* **Primary Engine: Descending Cursor Traversal**:
+  - Request format:
+    ```http
+    GET /wiki/api/v2/pages?sort=-modified-date&status=current,trashed&limit=250&body-format=storage HTTP/1.1
+    Host: your-domain.atlassian.net
+    Authorization: Bearer <api_token>
+    Accept: application/json
+    ```
+  - Follows opaque cursor tokens from `_links.next` with $O(1)$ database efficiency.
+* **The Descending Early-Exit Condition**:
+  - Because results are sorted descending (`-modified-date`), the newest edits appear on Page 1.
+  - When `page.version.createdAt <= last_sync_watermark`, the client **immediately halts pagination**. All subsequent pages are guaranteed to be older, eliminating brute-force scans.
+* **Secondary Engine: CQL Sliding-Window Search**:
+  - Used for parallel multi-space historical backfills:
+    `cql=lastModified >= "2025-01-01 00:00" AND lastModified < "2025-06-01 00:00" AND status in (current, trashed)`
+  - Bounded temporal slicing avoids the legacy 10,000 offset degradation.
 
-* **Endpoint**: `GET /wiki/api/v2/pages`
-* **Query Parameters**:
-  - `sort=-modified-date`: Sorts strictly from newest modified to oldest.
-  - `status=current,trashed`: Captures active documents and soft-deleted documents.
-  - `body-format=storage`: Fetches storage-format XHTML content.
-  - `limit=250`: Optimal batch payload size.
+### 2.3 `CandidateWatermarkManager` (Mid-Process Restart Engine)
+Solves the descending pagination dilemma:
+* **The Problem**: In descending crawls, the highest (newest) timestamp is discovered on Page 1, but cannot be committed as the active watermark until all pages down to the previous watermark are successfully ingested.
+* **The Solution**: 
+  - On Page 1, the candidate watermark is recorded in memory and staged in `confluence_state_checkpoints`.
+  - For each intermediate page, the active cursor (`_links.next`) is committed to the checkpoint store.
+  - Only when the early-exit condition or end-of-feed is reached is `candidate_high_watermark` atomically promoted to the persistent `confluence_watermarks` table.
 
-```http
-GET /wiki/api/v2/pages?sort=-modified-date&status=current,trashed&limit=250&body-format=storage HTTP/1.1
-Host: your-domain.atlassian.net
-Authorization: Bearer <api_token>
-Accept: application/json
-```
+### 2.4 `ConfluenceAttachmentStreamer` (Direct Zero-Buffer Streaming)
+Streams page attachments directly into Cloud Storage:
+* **Child Attachment Discovery**: Queries child attachments for modified pages (`GET /wiki/api/v2/pages/{id}/attachments`).
+* **Zero-RAM Streaming**: Streams raw bitstreams directly from Atlassian Media CDN to Cloud Object Storage (`s3://` or `abfss://`) in 4MB chunks.
+* **Streaming Checksum**: Computes `SHA-256` on the fly as chunks transit through the worker buffer.
+* **Lineage Preservation**: Tags attachment metadata with `parent_page_id`, preserving structural hierarchy.
 
-### 2.2 The Descending Sort + Early-Exit Algorithm
-Because pages are ordered by `-modified-date`, the ingestor guarantees $O(\Delta)$ network requests (proportional only to changed items) without scanning the entire workspace:
+### 2.5 `ConfluenceRestrictionExtractor` (Raw Permission Capture)
+Preserves native Confluence access rules untouched:
+* **Page Restrictions**: Queries `/wiki/api/v2/pages/{page-id}/restrictions` for explicit read/edit user and group restrictions.
+* **Space Permissions**: Extracts space-level permission schemes.
+* **Raw Preservation**: Writes raw JSON permission payloads directly to the `raw_acls` column in Bronze without premature flattening.
 
-```mermaid
-flowchart TD
-    Start(["Start Incremental Run (last_watermark)"]):::blue
-    FetchPage["Fetch Page Batch: sort=-modified-date"]:::purple
-    CheckFirst{"Is this Page 1?"}:::amber
-    RecordCand["Record Candidate High Watermark:\ncandidate_wm = batch[0].version.createdAt"]:::blue
-    IterateItems["Evaluate Item in Batch"]:::blue
-    CheckItem{"item.version.createdAt <= last_watermark?"}:::amber
-    EarlyExit["HALT PAGINATION (Early Exit Condition Met)"]:::green
-    ProcessItem["Process Item:\n- Content SHA-256 Check\n- Check Attachments\n- Merge to Bronze"]:::cyan
-    MoreItems{"More items in batch?"}:::amber
-    FollowCursor["Fetch next cursor URL"]:::purple
-    PromoteWM["Commit Candidate High Watermark:\nlast_watermark = candidate_wm"]:::green
-    Finish(["Run Completed Successfully"]):::green
+### 2.6 `TombstoneDetector` (Deletion Detection)
+* Detects soft-deleted pages where `status == "trashed"`.
+* Emits tombstone records (`is_deleted = TRUE`, `deleted_at = CURRENT_TIMESTAMP`) into Bronze.
 
-    Start --> FetchPage
-    FetchPage --> CheckFirst
-    CheckFirst -- "Yes" --> RecordCand --> IterateItems
-    CheckFirst -- "No" --> IterateItems
-    IterateItems --> CheckItem
-    CheckItem -- "Yes" --> EarlyExit --> PromoteWM --> Finish
-    CheckItem -- "No" --> ProcessItem --> MoreItems
-    MoreItems -- "Yes" --> IterateItems
-    MoreItems -- "No" --> FollowCursor --> FetchPage
-
-    classDef default fill:#ffffff,stroke:#475569,stroke-width:2.5px,color:#0f172a;
-    classDef blue    fill:#ffffff,stroke:#2563eb,stroke-width:2.5px,color:#0f172a;
-    classDef green   fill:#ffffff,stroke:#059669,stroke-width:2.5px,color:#0f172a;
-    classDef amber   fill:#ffffff,stroke:#d97706,stroke-width:2.5px,color:#0f172a;
-    classDef purple  fill:#ffffff,stroke:#7c3aed,stroke-width:2.5px,color:#0f172a;
-    classDef cyan    fill:#ffffff,stroke:#0891b2,stroke-width:2.5px,color:#0f172a;
-    linkStyle default stroke:#0284c7,stroke-width:2px;
-```
-
-### 2.3 Secondary Engine: Confluence Query Language (CQL) for Historical Backfill
-For massive historical migrations across hundreds of spaces, sequential cursor traversal over a single thread creates an operational bottleneck. **CQL sliding-window queries** partition the historical space across parallel workers:
-
-* **Endpoint**: `GET /wiki/rest/api/content/search`
-* **Sliding Window Expression**:
-  ```
-  cql=lastModified >= "2025-01-01 00:00" AND lastModified < "2025-06-01 00:00" 
-      AND status in (current, trashed) 
-      AND type in (page, blogpost, attachment) 
-      order by lastModified asc
-  ```
-* **Guardrail**: CQL searches degrade if `start > 10000`. Historical partition bounds must be sized to encompass $\le 5,000$ documents per slice.
+### 2.7 `BronzeSinkWriter` (Idempotent Metadata Sinking)
+* Merges page and attachment batches into `bronze_confluence_documents`.
+* Uses primary key `(tenant_id, container_id, item_id, version_number)` to guarantee that retrying an interrupted batch produces zero duplicate records.
 
 ---
 
 ## 3. Mid-Process Restart & Reliability Engine (Zero Rework)
-
-### 3.1 The Watermark Staging Challenge in Descending Sync
-Because the feed is sorted descending:
-* The **newest modification** appears on **Page 1**.
-* The **watermark threshold** appears on the **last page** of the crawl.
-
-> [!CAUTION]
-> **Anti-Pattern**: If an ingestor commits the newest timestamp on Page 1 as the active watermark, and crashes on Page 2, subsequent runs will assume the sync finished at Page 1's timestamp. **All changes between Page 2 and the old watermark would be permanently lost!**
-
-### 3.2 Two-Tier Checkpoint Protocol
-To guarantee complete data integrity and eliminate rework upon restart:
 
 ```mermaid
 %%{init: {
@@ -218,199 +177,103 @@ To guarantee complete data integrity and eliminate rework upon restart:
 }}%%
 sequenceDiagram
     autonumber
-    participant W as Confluence Ingest Worker
-    participant CS as Checkpoint Store (StateDB)
-    participant C as Confluence REST v2
-    participant OS as Cloud Object Store (S3/ADLS)
-    participant B as Bronze Delta Table
-    participant WM as Persistent Watermark Store
+    participant Ctrl as ConfluenceIngestController
+    participant StateDB as State Store (Checkpoints)
+    participant Conf as Confluence REST v2 API
+    participant Stream as ConfluenceAttachmentStreamer
+    participant Bronze as BronzeSinkWriter (Delta Table)
+    participant Watermark as Watermark Store
 
-    W->>CS: Check for active/resumable run for space_id
-    alt Prior run crashed with status IN_PROGRESS
-        CS-->>W: Return (candidate_high_watermark, active_cursor)
-        W->>W: Resume from active_cursor
-    else Fresh run
-        W->>WM: Get last_committed_watermark (e.g. 2026-09-15T00:00:00Z)
-        WM-->>W: Return timestamp
-        W->>C: GET /pages?sort=-modified-date&limit=250
-        C-->>W: Page 1 results (newest item: 2026-09-16T10:00:00Z) + next_cursor
-        W->>CS: Stage candidate_high_watermark = 2026-09-16T10:00:00Z, cursor = next_cursor
+    Ctrl->>StateDB: Query Active Checkpoint (space_id)
+    alt In-progress run exists (status = IN_PROGRESS)
+        StateDB-->>Ctrl: Return (candidate_high_watermark, active_cursor)
+    else Clean start
+        Ctrl->>Watermark: Read last_committed_watermark
+        Watermark-->>Ctrl: Return timestamp (e.g. 2026-09-15T00:00:00Z)
+        Ctrl->>Conf: GET /pages?sort=-modified-date&limit=250
+        Conf-->>Ctrl: Page 1 items + next_cursor
+        Ctrl->>StateDB: Stage candidate_high_watermark = Page1[0].createdAt
     end
 
-    loop Page Processing Loop
-        loop For each page in batch
+    loop Batch Page Loop
+        loop For Each Item in Batch
             alt Item is trashed
-                W->>W: Stage Tombstone Record
+                Ctrl->>Ctrl: Stage Tombstone Record
             else Content SHA-256 matches existing Bronze record
-                W->>W: Update metadata only (Bypass parse/embedding)
-            else Content Changed
-                W->>C: GET Child Attachments
-                C-->>W: Attachment metadata + download links
-                W->>OS: Stream Attachments (Direct HTTP to S3)
-                W->>W: Stage Bronze Page + Child Attachment Records
+                Ctrl->>Ctrl: Stage Metadata update only
+            else New or Modified Content
+                Ctrl->>Stream: Stream Child Attachments to S3/ADLS
+                Stream-->>Ctrl: Attachment Commit ACK + SHA-256
+                Ctrl->>Ctrl: Stage Page + Attachment Records
             end
         end
 
-        W->>B: ACID MERGE INTO bronze_confluence_documents
-        B-->>W: Commit ACK (Delta version N)
-        W->>CS: Commit Checkpoint (active_cursor = next_cursor)
+        Ctrl->>Bronze: ACID MERGE Batch (250 items)
+        Bronze-->>Ctrl: Commit ACK (Delta version N)
+        Ctrl->>StateDB: Update Checkpoint (stage=BATCH_COMMITTED, cursor=next_cursor)
 
-        alt Early exit reached (item.modified <= last_committed_watermark)
-            note over W: Early exit reached! Breaking loop.
+        alt Early Exit Condition Met (item.createdAt <= last_committed_watermark)
+            note over Ctrl: Early exit triggered! Loop halted.
         end
     end
 
-    W->>WM: Atomically promote candidate_high_watermark to active watermark
-    W->>CS: Mark run status = COMPLETED
+    Ctrl->>Watermark: Atomically promote candidate_high_watermark to committed
+    Ctrl->>StateDB: Mark Checkpoint (status=COMPLETED)
 ```
 
-### 3.3 Checkpoint State Store Schema
-The checkpoint state is tracked in an ACID Delta table:
+### 3.1 Crash Recovery Matrix
 
-```sql
-CREATE TABLE IF NOT EXISTS confluence_state_checkpoints (
-    tenant_id                   STRING NOT NULL,
-    space_id                    STRING NOT NULL,
-    run_id                      STRING NOT NULL,
-    status                      STRING NOT NULL, -- 'IN_PROGRESS', 'BATCH_COMMITTED', 'COMPLETED', 'FAILED'
-    candidate_high_watermark    TIMESTAMP NOT NULL,
-    baseline_watermark          TIMESTAMP,
-    active_cursor               STRING,          -- Cursor URL token
-    items_processed_in_run      BIGINT NOT NULL DEFAULT 0,
-    bytes_streamed_in_run       BIGINT NOT NULL DEFAULT 0,
-    last_error_message          STRING,
-    created_at                  TIMESTAMP NOT NULL,
-    updated_at                  TIMESTAMP NOT NULL
-) USING DELTA
-PARTITIONED BY (tenant_id, space_id);
-```
-
-### 3.4 Crash Recovery Matrix
-
-| Crash Scenario | System State | Recovery Protocol | Rework Incurred |
+| Crash Scenario | System State at Crash | Ingestor Action on Restart | Rework Incurred |
 | :--- | :--- | :--- | :--- |
-| **Crash on Page 1 before any batch commit** | Checkpoint not created or empty. | Ingestor queries persistent `confluence_watermarks` and restarts Page 1 cleanly. | Zero. |
-| **Crash during Attachment Streaming** | Some attachments streamed to S3; batch not committed to Bronze. | Worker resumes at current `active_cursor`. Deterministic storage paths `{space}/{page_id}/{sha256}.{ext}` ensure already uploaded attachments are matched via `HEAD` request and skipped. | **Zero duplicate bytes transferred.** |
-| **Crash between Bronze Merge and Checkpoint Commit** | Bronze table has batch; checkpoint has previous cursor. | Worker refetches the same cursor; `MERGE INTO` detects matching `(space_id, page_id, version_number)` and executes an idempotent update. | Minimal (1 API GET call; zero parsing). |
-| **Pod Eviction (SIGTERM received)** | Signal trapped by process. | Worker completes the current page batch, commits cursor to `confluence_state_checkpoints`, and halts gracefully. | **Zero rework**. |
+| **Crash during Attachment Streaming** | Some attachments written to storage; batch not merged into Bronze. | Ingestor re-reads current `active_cursor`. For each attachment, deterministic path `{space}/{page_id}/{sha256}.{ext}` is checked via `HEAD`. If already present, streaming is bypassed. | **Zero duplicate bytes transferred.** |
+| **Crash during Bronze Merge** | Delta Lake transaction rolled back automatically by ACID engine. | Ingestor re-fetches the same cursor; batch is re-merged cleanly. | **Zero duplicate records created.** |
+| **Crash between Bronze Merge and Checkpoint Commit** | Bronze has records; checkpoint still points to previous cursor. | Ingestor re-reads the page; `MERGE INTO` detects existing `(item_id, version_number)` and executes an idempotent no-op. | Minimal (1 Confluence GET call; zero re-downloads). |
+| **Graceful Preemption (SIGTERM)** | Kubernetes sends termination signal to worker pod. | `ConfluenceIngestController` finishes active item, writes checkpoint, and halts. | **Zero rework.** |
 
 ---
 
-## 4. Attachment Ingestion & Lineage Mapping
+## 4. Network Resilience & Rate-Limiting Engine
 
-Confluence pages frequently embed architectural diagrams, specification spreadsheets, and PDFs as attachments.
-
-### 4.1 Child Attachment Extraction Protocol
-1. For every created or modified page, query the child attachments endpoint:
-   ```http
-   GET /wiki/api/v2/pages/{page-id}/attachments?limit=100 HTTP/1.1
-   Host: your-domain.atlassian.net
-   Authorization: Bearer <api_token>
-   ```
-2. For each attachment:
-   * Evaluate `fileSize` and `version.createdAt`.
-   * Compare `content_sha256` against Lakehouse catalog.
-   * If modified or new, stream binary directly from Confluence Media CDN to Cloud Object Storage:
-     `abfss://lakehouse@storage.dfs.core.windows.net/raw/confluence/{tenant_id}/{space_id}/{page_id}/attachments/{attachment_id}/{content_sha256}.{ext}`
-3. **Lineage Ingestion**:
-   In `bronze_confluence_documents`, the attachment record stores `parent_page_id = page_id` and `entity_type = 'attachment'`. When Silver chunks are created, breadcrumbs automatically inject:
-   `Space > Parent Page Title > Attachment File Name`.
-
----
-
-## 5. Security, Identity & Late-Binding Access Control
-
-### 5.1 Confluence Permission Topology
-Permissions are enforced at two tiers:
-1. **Space Permissions**: Space-wide access granted to user groups (e.g., `confluence-users`, `finance-dept`).
-2. **Page Restrictions**: Fine-grained view or edit restrictions placed on specific pages:
-   ```http
-   GET /wiki/api/v2/pages/{page-id}/restrictions HTTP/1.1
-   Host: your-domain.atlassian.net
-   ```
-
-### 5.2 Incremental Permission Auditing
-Confluence pages do not bump `version.number` when only access restrictions change. To capture security updates incrementally:
-* **Confluence Audit Log API**:
-  `GET /wiki/api/v2/audit-records?startDate={last_audit_sync}`
-* Filter for events:
-  - `Page Restriction Added`
-  - `Page Restriction Removed`
-  - `Space Permissions Changed`
-* **Trigger**: When an audit record is received for a `page_id`, the worker updates the `raw_acls` field in Bronze and marks the Silver record for re-normalization without re-parsing the document body.
-
-### 5.3 Query-Time Enforcement
-* Silver chunks store normalized Atlassian Account IDs and Group IDs (`allowed_group_ids: ["grp_engineering_core"]`).
-* Downstream RAG vector searches filter chunks using late-binding security:
-  $$\text{Query Filter: } \text{user\_atlassian\_groups} \cap \text{chunk\_allowed\_group\_ids} \neq \emptyset$$
-
----
-
-## 6. Tombstones & Deletion Lifecycle
-
-### 6.1 Soft-Delete (`status: "trashed"`)
-* Captured directly by querying `status=current,trashed`.
-* When `page.status == "trashed"`, Bronze appends a tombstone record:
-  ```sql
-  INSERT INTO bronze_confluence_documents (
-      tenant_id, container_id, item_id, entity_type, is_deleted, deleted_at, ingestion_timestamp
-  ) VALUES (
-      'atlassian_tenant', 'ENG', '10485761', 'page', TRUE, CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP()
-  );
-  ```
-* Downstream vector indexes immediately delete vectors for `item_id = '10485761'`.
-
-### 6.2 Permanent Purge (`removed`) & Weekly Reconciliation
-When an administrator empties the trash, the page is purged from the database and will not appear in descending modified date queries.
-* **Weekly Reconciliation Diff**:
-  1. Once per week, a lightweight sweeper queries all active IDs in a space:
-     `GET /wiki/api/v2/spaces/{id}/pages?limit=250` (projecting only `id`).
-  2. The sweeper compares active IDs against the Bronze Lakehouse catalog.
-  3. Lakehouse IDs missing from Confluence are marked with `is_permanently_purged = TRUE` and vectors are evicted.
-
----
-
-## 7. Network Resilience & Rate Limiting
-
-### 7.1 Atlassian Cloud Rate Limits
+### 4.1 Atlassian Cloud Rate Limits
 Atlassian Cloud enforces tenant-level token bucket limits.
-* **Status Code**: `HTTP 429 Too Many Requests`.
-* **Header**: `Retry-After: <seconds>`.
-* Ingestors implement exponential backoff with jitter, pausing all space workers across the tenant when a `429` is received to avoid cascading lockout.
+* **HTTP 429 Status**: Atlassian responds with `429 Too Many Requests`.
+* **`Retry-After` Header**: Specifies wait time in seconds.
+* **Worker Backoff**: The ingestor pauses requests with exponential jitter:
+  $$\text{Sleep Time} = \max(\text{Retry-After}, \text{base} \cdot 2^{\text{attempt}}) + \text{jitter}(0, 1)$$
 
 ---
 
-## 8. Observability, Logging & Monitoring
+## 5. Ingestor Observability & Telemetry
 
-### 8.1 Prometheus Metrics Catalog
+### 5.1 Prometheus Metrics Catalog
 
 | Metric Name | Type | Labels | Description |
 | :--- | :--- | :--- | :--- |
-| `confluence_sync_duration_seconds` | Histogram | `tenant_id`, `space_id`, `status` | Time taken to complete a space synchronization run. |
+| `confluence_sync_duration_seconds` | Histogram | `tenant_id`, `space_id`, `status` | Total duration of a space synchronization run. |
 | `confluence_pages_discovered_total` | Counter | `tenant_id`, `space_id` | Total pages and blogposts returned by API queries. |
-| `confluence_attachments_streamed_total` | Counter | `tenant_id`, `space_id` | Number of binary attachments streamed to S3/ADLS. |
+| `confluence_attachments_streamed_total` | Counter | `tenant_id`, `space_id` | Count of binary attachments streamed to object storage. |
 | `confluence_items_skipped_cache_total` | Counter | `tenant_id`, `space_id` | Items bypassed due to matching content SHA-256. |
 | `confluence_tombstones_processed_total` | Counter | `tenant_id`, `space_id` | Trashed or purged pages tombstoned in Lakehouse. |
 | `confluence_bytes_streamed_total` | Counter | `tenant_id`, `space_id` | Raw payload bytes transferred to cloud storage. |
 | `confluence_api_requests_total` | Counter | `endpoint`, `status_code` | HTTP requests to Atlassian Confluence REST APIs. |
-| `confluence_api_throttles_429_total` | Counter | `tenant_id` | Total HTTP 429 throttle events. |
-| `confluence_watermark_lag_seconds` | Gauge | `tenant_id`, `space_id` | Age of latest watermark compared to `now()`. |
+| `confluence_api_throttles_429_total` | Counter | `tenant_id` | Count of HTTP 429 throttle responses encountered. |
+| `confluence_watermark_lag_seconds` | Gauge | `tenant_id`, `space_id` | Time delta between `now()` and timestamp of last successful sync. |
 | `confluence_early_exits_total` | Counter | `tenant_id`, `space_id` | Count of pagination loops successfully terminated by early exit. |
 
-### 8.2 OpenTelemetry Trace Spans
+### 5.2 OpenTelemetry Distributed Tracing
 ```
 [Trace: confluence_sync_space]
-  ├── [Span: state.get_checkpoint]
-  ├── [Span: confluence.fetch_pages_batch] (attributes: page_count=250, sort="-modified-date")
+  ├── [Span: checkpoint.get_active_cursor]
+  ├── [Span: confluence.fetch_pages_batch] (attributes: limit=250, sort="-modified-date")
   │     ├── [Span: confluence.fetch_restrictions] (attributes: page_id="10485761")
   │     ├── [Span: confluence.fetch_attachments] (attributes: page_id="10485761")
-  │     │     └── [Span: blob.stream_to_adls] (attributes: attachment_id="99182", bytes=451200)
-  │     └── [Span: delta.merge_bronze] (attributes: batch_size=250)
-  ├── [Span: state.commit_checkpoint] (attributes: active_cursor)
+  │     │     └── [Span: blob.stream_to_storage] (attributes: attachment_id="99182", bytes=451200)
+  │     └── [Span: bronze.acid_merge_batch] (attributes: batch_size=250)
+  ├── [Span: checkpoint.commit_batch] (attributes: committed_cursor)
   └── [Span: watermark.promote_high_watermark] (attributes: watermark="2026-09-16T10:00:00Z")
 ```
 
-### 8.3 Structured JSON Audit Logging
+### 5.3 Structured JSON Audit Logging
 ```json
 {
   "timestamp": "2026-09-16T08:35:20.892Z",
@@ -433,9 +296,9 @@ Atlassian Cloud enforces tenant-level token bucket limits.
 
 ---
 
-## 9. Lakehouse Table Contracts & DDL
+## 6. External Data Contracts & Table DDL
 
-### 9.1 Bronze Delta Table DDL
+### 6.1 Bronze Delta Table DDL (`bronze_confluence_documents`)
 ```sql
 CREATE TABLE IF NOT EXISTS bronze_confluence_documents (
     tenant_id               STRING NOT NULL,
@@ -460,16 +323,21 @@ CREATE TABLE IF NOT EXISTS bronze_confluence_documents (
 PARTITIONED BY (tenant_id, container_id, entity_type);
 ```
 
-### 9.2 Watermark State Table DDL
+### 6.2 Checkpoint State Store DDL (`confluence_state_checkpoints`)
 ```sql
-CREATE TABLE IF NOT EXISTS confluence_watermarks (
-    tenant_id               STRING NOT NULL,
-    space_id                STRING NOT NULL,
-    entity_type             STRING NOT NULL,       -- 'pages', 'attachments'
-    last_sync_watermark     TIMESTAMP NOT NULL,
-    items_synced_total      BIGINT NOT NULL,
-    last_successful_run_id  STRING NOT NULL,
-    updated_at              TIMESTAMP NOT NULL
+CREATE TABLE IF NOT EXISTS confluence_state_checkpoints (
+    tenant_id                   STRING NOT NULL,
+    space_id                    STRING NOT NULL,
+    run_id                      STRING NOT NULL,
+    status                      STRING NOT NULL, -- 'IN_PROGRESS', 'BATCH_COMMITTED', 'COMPLETED', 'FAILED'
+    candidate_high_watermark    TIMESTAMP NOT NULL,
+    baseline_watermark          TIMESTAMP,
+    active_cursor               STRING,          -- Cursor URL token
+    items_processed_in_run      BIGINT NOT NULL DEFAULT 0,
+    bytes_streamed_in_run       BIGINT NOT NULL DEFAULT 0,
+    last_error_message          STRING,
+    created_at                  TIMESTAMP NOT NULL,
+    updated_at                  TIMESTAMP NOT NULL
 ) USING DELTA
 PARTITIONED BY (tenant_id, space_id);
 ```
