@@ -22,60 +22,65 @@ The Ingestor operates as an isolated, containerized daemon or worker pod. It con
 
 ```mermaid
 flowchart TD
-    subgraph Stage1 ["Stage 1: State & Watermark Ingress"]
-        StateDB[("ACID State Store\n(Retrieve active cursor or committed watermark)")]:::amber
+    subgraph Upstream ["1. Upstream Source Systems (Pull-Only)"]
+        SP_API["Microsoft Graph API\n(Delta Queries & Download CDN)"]:::purple
+        CF_API["Confluence REST API v2\n(Cursor Pagination & Media CDN)"]:::purple
     end
 
-    subgraph Stage2 ["Stage 2: Pull Discovery & Change Polling"]
-        SP_Source["SharePoint Graph Delta\n(GET /drives/{id}/root/delta)"]:::purple
-        CF_Source["Confluence REST v2 Cursors\n(GET /pages?sort=-modified-date)"]:::purple
+    subgraph StateTier ["2. ACID State Store"]
+        StateDB[("ACID State Store\n(Checkpoints & Watermarks)")]:::amber
     end
 
-    subgraph Stage3 ["Stage 3: Ingestor Internal Processing Pipeline"]
-        ChangeEval["Change Evaluator\n(Hash Verification, Early-Exit, Tombstone Detection)"]:::blue
-        BlobStreamer["BlobStreamer Engine\n(Zero-RAM HTTP Stream -> Cloud Storage & SHA-256)"]:::cyan
-        AclExtractor["AclExtractor Engine\n(Source-Native Permissions & Restrictions Capture)"]:::red
+    subgraph Ingestor ["3. Ingestor Container (Dedicated Ingest Engine)"]
+        Controller["IngestController\n(Run Lifecycle & SIGTERM Trapper)"]:::blue
+        CheckpointMgr["CheckpointManager\n(Watermark & Cursor Coordinator)"]:::amber
+        SourceClient["Source API Client\n(Auth, Paging & 429 Backoff)"]:::blue
+        AclExtractor["AclExtractor\n(Source Permissions Capture)"]:::red
+        BlobStreamer["BlobStreamer\n(Zero-RAM HTTP -> Cloud Store & SHA-256)"]:::cyan
+        BronzeWriter["BronzeSinkWriter\n(Idempotent Batch Committer)"]:::green
+        Telemetry["TelemetryEngine\n(Prometheus /metrics & OTel Spans)"]:::cyan
     end
 
-    subgraph Stage4 ["Stage 4: Dual External Sinks"]
+    subgraph Sinks ["4. Storage & Lakehouse Sinks"]
         BlobStore[("Cloud Object Storage (S3 / ADLS Gen2)\nDeterministic: .../{item_id}/{sha256}.{ext}")]:::green
         BronzeTable[("Bronze Metadata Sink\n(Delta Lake / Iceberg Table)")]:::green
     end
 
-    subgraph Stage5 ["Stage 5: State Commit & Telemetry"]
-        CommitCheckpoint[("State Store Checkpoint\n(Atomic Cursor Advance / Watermark Promotion)")]:::amber
-        TelemetryExport["Continuous Observability\n(Prometheus /metrics, OTel Traces, JSON Logs)"]:::cyan
+    subgraph Observers ["5. Observability Sinks"]
+        Prom["Prometheus Server\n(Metrics Scraping)"]:::amber
+        Otel["OpenTelemetry Collector\n(Trace Spans)"]:::cyan
+        Logs["Log Aggregator\n(Structured JSON Logs)"]:::amber
     end
 
     %% Data Flow Transitions
-    StateDB -->|1. Supply last cursor / watermark| SP_Source
-    StateDB -->|1. Supply last cursor / watermark| CF_Source
+    StateDB -->|1. Supply last cursor / watermark| CheckpointMgr
+    CheckpointMgr -->|2. Feed start token| SourceClient
+    SourceClient <-->|3. Poll change batches| Upstream
 
-    SP_Source -->|2. Stream Delta Changes| ChangeEval
-    CF_Source -->|2. Stream Descending Pages| ChangeEval
+    SourceClient -->|4a. Items with permissions| AclExtractor
+    SourceClient -->|4b. Files to download| BlobStreamer
+    SourceClient -->|4c. Metadata & unchanged items| BronzeWriter
 
-    ChangeEval -->|3a. If Binary Modified| BlobStreamer
-    ChangeEval -->|3b. If Permissions Changed| AclExtractor
-    ChangeEval -->|3c. Forward Item Metadata| BronzeTable
+    BlobStreamer -->|5a. Multipart stream upload| BlobStore
+    BlobStreamer -->|5b. Supply Cloud URI + SHA-256| BronzeWriter
+    AclExtractor -->|5c. Supply raw ACL payloads| BronzeWriter
 
-    BlobStreamer -->|4a. Multipart Bitstream Upload| BlobStore
-    BlobStreamer -->|4b. Supply Cloud URI + SHA-256| BronzeTable
-    AclExtractor -->|4c. Supply Raw ACL Payloads| BronzeTable
+    BronzeWriter -->|6. ACID Batch Merge| BronzeTable
+    BronzeWriter -->|7. Batch committed ACK| CheckpointMgr
+    CheckpointMgr -->|8. Commit cursor / promote watermark| StateDB
 
-    BronzeTable -->|5a. Batch Commit ACK| CommitCheckpoint
-    CommitCheckpoint -->|5b. Persist State| StateDB
+    %% Controller & Telemetry
+    Controller -.->|Supervise lifecycle & trap SIGTERM| SourceClient
+    Telemetry -.-> Prom
+    Telemetry -.-> Otel
+    Telemetry -.-> Logs
 
-    %% Telemetry Stream
-    ChangeEval -.-> TelemetryExport
-    BlobStreamer -.-> TelemetryExport
-    BronzeTable -.-> TelemetryExport
-
-    %% Subgraphs Styling
-    style Stage1 fill:none,stroke:#475569,stroke-width:2px,stroke-dasharray: 4 4,color:#475569
-    style Stage2 fill:none,stroke:#475569,stroke-width:2px,stroke-dasharray: 4 4,color:#475569
-    style Stage3 fill:none,stroke:#475569,stroke-width:2px,stroke-dasharray: 4 4,color:#475569
-    style Stage4 fill:none,stroke:#475569,stroke-width:2px,stroke-dasharray: 4 4,color:#475569
-    style Stage5 fill:none,stroke:#475569,stroke-width:2px,stroke-dasharray: 4 4,color:#475569
+    %% Subgraphs Style
+    style Upstream fill:none,stroke:#475569,stroke-width:2px,stroke-dasharray: 4 4,color:#475569
+    style StateTier fill:none,stroke:#475569,stroke-width:2px,stroke-dasharray: 4 4,color:#475569
+    style Ingestor fill:none,stroke:#475569,stroke-width:2px,stroke-dasharray: 4 4,color:#475569
+    style Sinks fill:none,stroke:#475569,stroke-width:2px,stroke-dasharray: 4 4,color:#475569
+    style Observers fill:none,stroke:#475569,stroke-width:2px,stroke-dasharray: 4 4,color:#475569
 
     %% High-Visibility Link Arrows
     linkStyle default stroke:#0284c7,stroke-width:2px

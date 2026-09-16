@@ -13,70 +13,73 @@ The SharePoint Pull Ingestor runs as a stateless container pod or standalone dae
 
 ```mermaid
 flowchart TD
-    subgraph Stage1 ["Stage 1: State & Watermark Ingress"]
-        StateDB[("ACID State Store\n(Read active cursor or @odata.deltaLink)")]:::amber
+    subgraph UpstreamM365 ["1. Microsoft 365 Cloud (Upstream Source)"]
+        GraphDelta["Microsoft Graph Delta Endpoint\nGET /drives/{id}/root/delta"]:::purple
+        GraphPerms["Permissions Endpoint\nGET /items/{id}/permissions"]:::purple
+        AzureCDN["Azure Front Door CDN\n(@microsoft.graph.downloadUrl)"]:::purple
     end
 
-    subgraph Stage2 ["Stage 2: Delta Query Discovery"]
-        GraphAPI["Microsoft Graph API\n(GET /drives/{id}/root/delta)"]:::purple
-        DeltaResponse["Delta Change Feed\n(DriveItems batch + @odata.nextLink/@odata.deltaLink)"]:::blue
+    subgraph StateTier ["2. ACID State Store"]
+        StateDB[("ingestion_state_checkpoints\n& ingestion_watermarks")]:::amber
     end
 
-    subgraph Stage3 ["Stage 3: Item Classification & Extraction"]
-        TombstoneBranch["Deleted Item (@removed)\n(Stage Tombstone Record: is_deleted=TRUE)"]:::amber
-        UnchangedBranch["Unchanged Content (cTag/Hash Match)\n(Bypass Binary Stream; Update Metadata Only)"]:::cyan
-        AclBranch["Unique Permissions (hasUniqueRoleAssignments)\n(GET /permissions -> Raw ACL Payload)"]:::red
-        ModifiedBranch["New or Modified File Bitstream\n(@microsoft.graph.downloadUrl on Azure CDN)"]:::purple
+    subgraph SharePointIngestor ["3. SharePoint Pull Ingestor Component"]
+        Controller["SharePointIngestController\n(Run Lifecycle & SIGTERM Trapper)"]:::blue
+        CheckpointMgr["SharePointCheckpointManager\n(Watermark & Cursor Coordinator)"]:::amber
+        DeltaClient["GraphDeltaClient\n(Delta Paging & 429 Backoff)"]:::blue
+        TombstoneHandler["TombstoneDetector\n(@removed Deletion Handler)"]:::amber
+        AclExtractor["SharePointAclExtractor\n(hasUniqueRoleAssignments & Raw ACLs)"]:::red
+        BlobStreamer["SharePointBlobStreamer\n(Zero-RAM HTTP -> S3/ADLS & SHA-256)"]:::cyan
+        BronzeWriter["BronzeSinkWriter\n(Idempotent Delta Batch Committer)"]:::green
+        Telemetry["IngestorTelemetry\n(Prometheus Metrics & OTel Traces)"]:::cyan
     end
 
-    subgraph Stage4 ["Stage 4: Binary Streaming & Metadata Ingestion"]
-        StreamEngine["SharePointBlobStreamer\n(Pipes chunked HTTP -> S3/ADLS & Computes SHA-256)"]:::cyan
-        BronzeEngine["BronzeSinkWriter\n(Batches Metadata, Storage URIs, Hashes & Raw ACLs)"]:::green
-    end
-
-    subgraph Stage5 ["Stage 5: Dual Sinks & State Commit"]
-        ObjectStore[("Cloud Object Storage (S3 / ADLS Gen2)\nDeterministic: .../{item_id}/{sha256}.{ext}")]:::green
+    subgraph IngestSinks ["4. Storage & Lakehouse Sinks"]
+        CloudStorage[("Cloud Object Storage (S3 / ADLS Gen2)\nDeterministic: .../{item_id}/{sha256}.{ext}")]:::green
         BronzeTable[("Bronze Metadata Delta Table\n(bronze_sharepoint_documents)")]:::green
-        CommitState[("Commit Checkpoint / Watermark\n(Save nextLink / Promote deltaLink)")]:::amber
     end
 
-    subgraph TelemetrySink ["Continuous Process Observability"]
-        MetricsExporter["Prometheus /metrics & OTel Collector\n(Metrics, Spans & Structured Audit Logs)"]:::cyan
+    subgraph Observability ["5. Ingestor Observability Sinks"]
+        Prom["Prometheus Collector\n(Scrapes /metrics)"]:::amber
+        Otel["OpenTelemetry Collector\n(Trace Spans)"]:::cyan
+        Logs["Log Aggregator\n(Structured JSON Logs)"]:::amber
     end
 
     %% Data Flow Transitions
-    StateDB -->|1. Supply last cursor / deltaLink| GraphAPI
-    GraphAPI -->|2. Stream delta change pages| DeltaResponse
+    StateDB -->|1. Supply last cursor / deltaLink| CheckpointMgr
+    CheckpointMgr -->|2. Feed start token| DeltaClient
+    DeltaClient <-->|3. Poll delta change feed| GraphDelta
 
-    DeltaResponse -->|3a. If @removed| TombstoneBranch
-    DeltaResponse -->|3b. If cTag/hash unchanged| UnchangedBranch
-    DeltaResponse -->|3c. If unique role assignments| AclBranch
-    DeltaResponse -->|3d. If file content changed| ModifiedBranch
+    DeltaClient -->|4a. @removed events| TombstoneHandler
+    DeltaClient -->|4b. Items with unique perms| AclExtractor
+    DeltaClient -->|4c. File metadata & downloadUrl| BlobStreamer
+    DeltaClient -->|4d. Unchanged items / metadata| BronzeWriter
 
-    ModifiedBranch -->|4a. Stream chunked bytes| StreamEngine
-    StreamEngine -->|4b. Write bitstream multi-part| ObjectStore
-    StreamEngine -->|4c. Return cloud URI + SHA-256| BronzeEngine
+    AclExtractor <-->|Fetch raw permissions| GraphPerms
+    BlobStreamer <-->|Stream chunked bytes| AzureCDN
 
-    TombstoneBranch -->|4d. Forward tombstone record| BronzeEngine
-    UnchangedBranch -->|4e. Forward metadata-only record| BronzeEngine
-    AclBranch -->|4f. Forward raw ACL payload| BronzeEngine
+    BlobStreamer -->|5a. Multipart stream upload| CloudStorage
+    BlobStreamer -->|5b. Supply Cloud URI + SHA-256| BronzeWriter
+    AclExtractor -->|5c. Supply raw ACL payloads| BronzeWriter
+    TombstoneHandler -->|5d. Supply tombstone records| BronzeWriter
 
-    BronzeEngine -->|5a. ACID Batch Merge| BronzeTable
-    BronzeTable -->|5b. Commit ACK| CommitState
-    CommitState -->|5c. Persist cursor / watermark| StateDB
+    BronzeWriter -->|6. ACID Batch Merge| BronzeTable
+    BronzeWriter -->|7. Batch committed ACK| CheckpointMgr
+    CheckpointMgr -->|8. Commit cursor / promote deltaLink| StateDB
 
-    %% Telemetry Flow
-    StreamEngine -.-> MetricsExporter
-    BronzeEngine -.-> MetricsExporter
-    CommitState -.-> MetricsExporter
+    %% Controller & Telemetry
+    Controller -.->|Supervise run loop & trap SIGTERM| DeltaClient
+    Controller -.->|Trigger batch flush| BronzeWriter
+    Telemetry -.-> Prom
+    Telemetry -.-> Otel
+    Telemetry -.-> Logs
 
     %% Subgraphs Styling
-    style Stage1 fill:none,stroke:#475569,stroke-width:2px,stroke-dasharray: 4 4,color:#475569
-    style Stage2 fill:none,stroke:#475569,stroke-width:2px,stroke-dasharray: 4 4,color:#475569
-    style Stage3 fill:none,stroke:#475569,stroke-width:2px,stroke-dasharray: 4 4,color:#475569
-    style Stage4 fill:none,stroke:#475569,stroke-width:2px,stroke-dasharray: 4 4,color:#475569
-    style Stage5 fill:none,stroke:#475569,stroke-width:2px,stroke-dasharray: 4 4,color:#475569
-    style TelemetrySink fill:none,stroke:#475569,stroke-width:2px,stroke-dasharray: 4 4,color:#475569
+    style UpstreamM365 fill:none,stroke:#475569,stroke-width:2px,stroke-dasharray: 4 4,color:#475569
+    style StateTier fill:none,stroke:#475569,stroke-width:2px,stroke-dasharray: 4 4,color:#475569
+    style SharePointIngestor fill:none,stroke:#475569,stroke-width:2px,stroke-dasharray: 4 4,color:#475569
+    style IngestSinks fill:none,stroke:#475569,stroke-width:2px,stroke-dasharray: 4 4,color:#475569
+    style Observability fill:none,stroke:#475569,stroke-width:2px,stroke-dasharray: 4 4,color:#475569
 
     %% High-Visibility Link Arrows
     linkStyle default stroke:#0284c7,stroke-width:2px
