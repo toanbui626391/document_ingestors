@@ -20,7 +20,21 @@ This directory contains research, architectural patterns, and API analysis for b
    * Confluence Data Center REST Webhooks API
    * Content extraction, ADF/Storage format to Markdown parsing, and page restrictions
 
-3. **[Architecture & Pipeline Patterns](file:///c:/Users/ToanBX/dev/personal/document_ingestors/docs/researchs/architecture_and_pipeline_patterns.md)**
+3. **[SharePoint & OneDrive Pull-Based Ingestion](file:///c:/Users/ToanBX/dev/personal/document_ingestors/docs/researchs/sharepoint_pull_based_apis.md)**
+   * Microsoft Graph Delta Query API (`/delta`) and `@odata.deltaLink` token persistence
+   * Native tombstone detection via `@removed` facet
+   * OData temporal filtering (`$filter=lastModifiedDateTime`) and Search (KQL)
+   * Direct pre-authenticated binary downloads (`@microsoft.graph.downloadUrl`)
+   * Broken ACL inheritance detection (`hasUniqueRoleAssignments`)
+
+4. **[Confluence Pull-Based Ingestion](file:///c:/Users/ToanBX/dev/personal/document_ingestors/docs/researchs/confluence_pull_based_apis.md)**
+   * Confluence REST API v2 Cursor Traversal (`sort=-modified-date` + early-exit algorithm)
+   * Confluence Query Language (CQL) incremental sliding windows
+   * Parallel bounded slicing for large historical backfills
+   * Version number short-circuiting and `SHA-256` content hashing
+   * Audit Log APIs for security and permission synchronization
+
+5. **[Architecture & Pipeline Patterns](file:///c:/Users/ToanBX/dev/personal/document_ingestors/docs/researchs/architecture_and_pipeline_patterns.md)**
    * End-to-end Event Ingress Topology (API Gateway, Queues, Workers, Lakehouse)
    * The "Notification-Triggered Delta Sync" Pattern
    * Operational Guardrails: Auto-renewal daemon, Daily reconciliation sweeper, Tombstone propagation
@@ -32,7 +46,10 @@ This directory contains research, architectural patterns, and API analysis for b
 
 | Capability / Dimension | Microsoft SharePoint / OneDrive | Atlassian Confluence |
 | :--- | :--- | :--- |
-| **Primary Event API** | Microsoft Graph Change Notifications (`POST /subscriptions`) | Atlassian Webhooks / Forge Triggers / Confluence Automation |
+| **Primary Event API (Push)** | Microsoft Graph Change Notifications (`POST /subscriptions`) | Atlassian Webhooks / Forge Triggers / Confluence Automation |
+| **Primary Pull Ingestion API** | Microsoft Graph Delta Query (`/delta`) | REST API v2 Cursor Traversal & CQL Search API |
+| **Incremental Watermarking Strategy** | Opaque `@odata.deltaLink` token | Descending modified date + cursor OR CQL sliding window |
+| **Historical Parallel Backfilling** | Partitioning by Drive ID / Folder Subtrees | Parallel Bounded CQL Date/Space Slicing |
 | **Cloud-Native Private Ingress** | Native streaming to **Azure Event Hubs** (no public webhook needed) | Native **Amazon EventBridge** integration via Confluence Automation |
 | **Encrypted In-Line Payload** | Supported (Rich Notifications with X.509/RSA encryption) | Standard JSON payload (requires token/HMAC validation) |
 | **Delta Query / State Link** | Native `@odata.deltaLink` (tracks creates, updates, deletes, moves) | Cursor-based sorting (`/wiki/api/v2/pages?sort=-modified-date`) |
