@@ -13,64 +13,76 @@ The Confluence Pull Ingestor runs as a stateless container pod or standalone dae
 
 ```mermaid
 flowchart TD
-    subgraph UpstreamAtlassian ["1. Atlassian Confluence (Upstream Source)"]
-        V2Pages["REST API v2 Pages & Blogs\nGET /wiki/api/v2/pages?sort=-modified-date"]:::purple
-        V2Attach["REST API v2 Attachments\nGET /wiki/api/v2/attachments"]:::purple
-        V2Perms["Restrictions Endpoint\nGET /wiki/api/v2/pages/{id}/restrictions"]:::purple
-        MediaCDN["Atlassian Media CDN\n(/wiki/download/attachments/...)"]:::purple
+    subgraph Stage1 ["Stage 1: State & Watermark Ingress"]
+        StateDB[("ACID State Store\n(Read active cursor or last_committed_watermark)")]:::amber
     end
 
-    subgraph ConfluenceIngestor ["2. Confluence Pull Ingestor Component"]
-        Controller["ConfluenceIngestController\n(Run Lifecycle & SIGTERM Signal Trapper)"]:::blue
-        CursorClient["ConfluenceCursorClient\n(Early-Exit Engine & 429 Token Bucket Backoff)"]:::blue
-        CandidateWmMgr["CandidateWatermarkManager\n(Descending Cursor & Watermark Staging)"]:::amber
-        AttachmentStreamer["ConfluenceAttachmentStreamer\n(Zero-RAM Streaming HTTP -> Cloud Storage)"]:::cyan
-        RestrictionParser["ConfluenceRestrictionExtractor\n(Page Restrictions & Space Permissions)"]:::red
-        TombstoneDetector["TombstoneDetector\n(Trashed Status & Deletion Auditing)"]:::amber
-        BronzeWriter["BronzeSinkWriter\n(Idempotent Delta Batch Committer)"]:::green
-        Telemetry["IngestorTelemetry\n(Prometheus /metrics & OTel Trace Spans)"]:::cyan
+    subgraph Stage2 ["Stage 2: Descending Traversal & Early-Exit"]
+        ConfluenceAPI["Confluence REST API v2\n(GET /pages?sort=-modified-date)"]:::purple
+        BatchFeed["Page Batch Feed\n(250 Pages/Blogs + next cursor link)"]:::blue
+        EarlyExitCheck{"item.modified <= watermark?"}:::amber
+        HaltTraversal["Early-Exit Condition Triggered\n(Halt Pagination; Promote Candidate Watermark)"]:::green
     end
 
-    subgraph IngestSinks ["3. External Ingestion Sinks"]
-        StateDB[("ACID State Store\n(confluence_state_checkpoints)")]:::amber
-        AttachmentStore[("Cloud Object Storage (S3 / ADLS Gen2)\nDeterministic: .../{item_id}/{sha256}.{ext}")]:::green
-        BronzeTable[("Bronze Metadata Sink\n(bronze_confluence_documents)")]:::green
+    subgraph Stage3 ["Stage 3: Item Classification & Extraction"]
+        TombstoneBranch["Trashed Page (status == 'trashed')\n(Stage Tombstone Record: is_deleted=TRUE)"]:::amber
+        UnchangedBranch["Unchanged Content (SHA-256 Match)\n(Bypass Attachment Stream; Update Metadata Only)"]:::cyan
+        RestrictionBranch["Page Restrictions API\n(GET /restrictions -> Raw JSON ACL Payload)"]:::red
+        AttachmentBranch["Child Attachments API\n(GET /attachments -> Media CDN Download Links)"]:::purple
     end
 
-    subgraph Observability ["4. Ingestor Observability Sinks"]
-        Prom["Prometheus Collector\n(Scrapes /metrics on Ingestor)"]:::amber
-        Otel["OpenTelemetry Collector\n(Ingestor Tracing Spans)"]:::cyan
-        Logs["Log Aggregator\n(Structured JSON Logs)"]:::amber
+    subgraph Stage4 ["Stage 4: Binary Streaming & Metadata Sinking"]
+        AttachmentStreamer["ConfluenceAttachmentStreamer\n(Pipes Media CDN HTTP -> S3/ADLS & Computes SHA-256)"]:::cyan
+        BronzeEngine["BronzeSinkWriter\n(Batches Pages, Attachments, Lineage & Raw ACLs)"]:::green
     end
 
-    %% Internal Subsystem Wiring
-    Controller --> CursorClient
-    Controller --> CandidateWmMgr
-    Controller --> AttachmentStreamer
-    Controller --> RestrictionParser
-    Controller --> TombstoneDetector
-    Controller --> BronzeWriter
-    Controller --> Telemetry
+    subgraph Stage5 ["Stage 5: Dual Sinks & Watermark Promotion"]
+        ObjectStore[("Cloud Object Storage (S3 / ADLS Gen2)\nDeterministic: .../{space}/{page_id}/{sha256}.{ext}")]:::green
+        BronzeTable[("Bronze Metadata Delta Table\n(bronze_confluence_documents)")]:::green
+        CommitState[("Commit Checkpoint / Promote Watermark\n(Advance cursor / Promote candidate_high_watermark)")]:::amber
+    end
 
-    %% Boundary Connections
-    CursorClient <-->|HTTPS GET v2/pages| V2Pages
-    RestrictionParser <-->|HTTPS GET restrictions| V2Perms
-    AttachmentStreamer <-->|HTTPS GET v2/attachments| V2Attach
-    AttachmentStreamer <-->|Direct Chunked Stream| MediaCDN
+    subgraph TelemetrySink ["Continuous Process Observability"]
+        MetricsExporter["Prometheus /metrics & OTel Collector\n(Metrics, Spans & Structured Audit Logs)"]:::cyan
+    end
 
-    CandidateWmMgr <-->|Read / Commit Checkpoints| StateDB
-    AttachmentStreamer -->|Multipart Upload| AttachmentStore
-    BronzeWriter -->|ACID Merge Batch| BronzeTable
+    %% Data Flow Transitions
+    StateDB -->|1. Supply watermark & active cursor| ConfluenceAPI
+    ConfluenceAPI -->|2. Stream descending change pages| BatchFeed
+    BatchFeed --> EarlyExitCheck
+    EarlyExitCheck -- "Yes" --> HaltTraversal
+    HaltTraversal -->|Promote candidate watermark| CommitState
+    EarlyExitCheck -- "No" --> Stage3
 
-    Telemetry -.-> Prom
-    Telemetry -.-> Otel
-    Telemetry -.-> Logs
+    BatchFeed -->|3a. If status == 'trashed'| TombstoneBranch
+    BatchFeed -->|3b. If body SHA-256 unchanged| UnchangedBranch
+    BatchFeed -->|3c. Fetch view/edit restrictions| RestrictionBranch
+    BatchFeed -->|3d. Fetch child attachments| AttachmentBranch
 
-    %% Subgraphs Style
-    style UpstreamAtlassian fill:none,stroke:#475569,stroke-width:2px,stroke-dasharray: 4 4,color:#475569
-    style ConfluenceIngestor fill:none,stroke:#475569,stroke-width:2px,stroke-dasharray: 4 4,color:#475569
-    style IngestSinks fill:none,stroke:#475569,stroke-width:2px,stroke-dasharray: 4 4,color:#475569
-    style Observability fill:none,stroke:#475569,stroke-width:2px,stroke-dasharray: 4 4,color:#475569
+    AttachmentBranch -->|4a. Stream chunked bytes| AttachmentStreamer
+    AttachmentStreamer -->|4b. Write bitstream multi-part| ObjectStore
+    AttachmentStreamer -->|4c. Return storage URI + SHA-256 + lineage| BronzeEngine
+
+    TombstoneBranch -->|4d. Forward tombstone record| BronzeEngine
+    UnchangedBranch -->|4e. Forward metadata-only record| BronzeEngine
+    RestrictionBranch -->|4f. Forward raw ACL payload| BronzeEngine
+
+    BronzeEngine -->|5a. ACID Batch Merge| BronzeTable
+    BronzeTable -->|5b. Commit ACK| CommitState
+    CommitState -->|5c. Persist cursor / watermark| StateDB
+
+    %% Telemetry Flow
+    AttachmentStreamer -.-> MetricsExporter
+    BronzeEngine -.-> MetricsExporter
+    CommitState -.-> MetricsExporter
+
+    %% Subgraphs Styling
+    style Stage1 fill:none,stroke:#475569,stroke-width:2px,stroke-dasharray: 4 4,color:#475569
+    style Stage2 fill:none,stroke:#475569,stroke-width:2px,stroke-dasharray: 4 4,color:#475569
+    style Stage3 fill:none,stroke:#475569,stroke-width:2px,stroke-dasharray: 4 4,color:#475569
+    style Stage4 fill:none,stroke:#475569,stroke-width:2px,stroke-dasharray: 4 4,color:#475569
+    style Stage5 fill:none,stroke:#475569,stroke-width:2px,stroke-dasharray: 4 4,color:#475569
+    style TelemetrySink fill:none,stroke:#475569,stroke-width:2px,stroke-dasharray: 4 4,color:#475569
 
     %% High-Visibility Link Arrows
     linkStyle default stroke:#0284c7,stroke-width:2px
