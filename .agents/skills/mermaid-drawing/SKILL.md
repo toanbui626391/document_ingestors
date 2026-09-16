@@ -25,9 +25,15 @@ This skill establishes the **Dual-Mode Standards** that guarantee 100% crystal-c
    * If the node fill is **Light/White (`#ffffff`)**: font color MUST be **Deep Charcoal (`#0f172a`)** (19:1 contrast).
    * If the node fill is **Dark/Midnight (`#0f172a`)**: font color MUST be **Pure White (`#ffffff`)** (16:1 contrast).
    * **Color must ONLY be applied to borders (`stroke`)**, indicators, and badges—never to the body text.
-2. **Subgraphs Must Be Transparent**:
+2. **Subgraphs Must Be Transparent & Visually Hierarchical**:
    * **NEVER** use solid background fills on subgraphs.
-   * Use `style SubgraphId fill:none,stroke:#475569,stroke-width:2px,stroke-dasharray: 4 4,color:#475569`.
+   * **Border Hierarchy for Container Scales (Bigger Containers = Thicker Borders)**:
+     - **Primary / Major / Bigger Containers** (e.g., the primary system boundary, core application container, or main engine pod): MUST use a **thicker, more prominent border line (`stroke-width: 3px` or `3.5px`)** to establish visual dominance:
+       `style MainContainer fill:none,stroke:#334155,stroke-width:3px,stroke-dasharray: 6 3,color:#334155` (or saturated accent `stroke:#2563eb`).
+     - **Secondary / Standard Containers** (e.g., external tiers, data sources, sinks): Use standard border thickness (`stroke-width: 2px`):
+       `style SecondaryContainer fill:none,stroke:#475569,stroke-width:2px,stroke-dasharray: 4 4,color:#475569`.
+     - **Minor / Nested Containers**: Use lighter border thickness (`stroke-width: 1.5px`):
+       `style MinorContainer fill:none,stroke:#64748b,stroke-width:1.5px,stroke-dasharray: 3 3,color:#64748b`.
 3. **Vibrant High-Visibility Link Arrows**:
    * Use saturated Cobalt Blue (`stroke:#0284c7,stroke-width:2px`) or High-Contrast Steel (`stroke:#334155,stroke-width:2px`).
    * Never use faint gray lines that fade into the background.
@@ -113,10 +119,10 @@ flowchart TD
     Bronze --> Parser
     Parser --> Silver
 
-    %% Subgraphs: Transparent with neutral dashed borders
+    %% Subgraphs: Transparent with visual hierarchy (Bigger container = thicker border)
     style Sources fill:none,stroke:#475569,stroke-width:2px,stroke-dasharray: 4 4,color:#475569
     style Ingress fill:none,stroke:#475569,stroke-width:2px,stroke-dasharray: 4 4,color:#475569
-    style Compute fill:none,stroke:#475569,stroke-width:2px,stroke-dasharray: 4 4,color:#475569
+    style Compute fill:none,stroke:#2563eb,stroke-width:3.5px,stroke-dasharray: 6 3,color:#2563eb
     style Storage fill:none,stroke:#475569,stroke-width:2px,stroke-dasharray: 4 4,color:#475569
 
     %% High-visibility link arrows
@@ -191,4 +197,5 @@ Before saving any Mermaid diagram:
 * [ ] Are there **ZERO** instances of pastel/colored text (e.g. no `#60a5fa`, `#34d399`, `#a78bfa` font colors)?
 * [ ] Are node borders set to a saturated accent with `stroke-width: 2.5px`?
 * [ ] Are subgraphs set to `fill:none` or `fill:transparent`?
+* [ ] Do **bigger / primary containers** have a **thicker border line (`stroke-width: 3px` or `3.5px`)** to establish visual hierarchy over standard/secondary sub-containers (`2px`)?
 * [ ] Are arrow links visible across both dark and light modes (`stroke:#0284c7`)?
