@@ -61,6 +61,7 @@ This directory contains research, architectural patterns, and API analysis for b
 
 ---
 
-## Related Project Guidelines
+## Related Project Guidelines & Solution Architectures
+* **[Solution Architecture Documents](file:///c:/Users/ToanBX/dev/personal/document_ingestors/docs/architectures/README.md)**: Production-grade design specifications for SharePoint & Confluence pull ingestors.
 * **[Data Architect Rules for AI Agents](file:///c:/Users/ToanBX/dev/personal/document_ingestors/.agents/rules/data_architect.md)**
 * **[Repository Agent Guidelines](file:///c:/Users/ToanBX/dev/personal/document_ingestors/AGENTS.md)**
